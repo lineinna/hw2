@@ -280,6 +280,7 @@ static int parse_node_key_value(const char *line, size_t line_len,
   size_t node_end = node_start;
   size_t key_start;
   size_t key_end;
+  size_t value_start;
 
   *node = NULL;
   *key = NULL;
@@ -299,11 +300,23 @@ static int parse_node_key_value(const char *line, size_t line_len,
   while (key_end < line_len && line[key_end] != ' ') {
     key_end++;
   }
-  if (key_end == key_start || key_end == line_len ||
+  if (key_end == key_start || key_end == line_len) {
+    return -1;
+  }
+  value_start = key_end + 1;
+  if (value_start == line_len ||
       copy_range(line + node_start, node_end - node_start, node) != 0 ||
       copy_range(line + key_start, key_end - key_start, key) != 0 ||
-      copy_range(line + key_end + 1, line_len - key_end - 1, value) != 0 ||
-      (*value)[0] == '\0') {
+      copy_range(line + value_start, line_len - value_start, value) != 0) {
+    free(*node);
+    free(*key);
+    free(*value);
+    *node = NULL;
+    *key = NULL;
+    *value = NULL;
+    return -1;
+  }
+  if ((*value)[0] == '\0') {
     free(*node);
     free(*key);
     free(*value);
