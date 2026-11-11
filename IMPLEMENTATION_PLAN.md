@@ -162,17 +162,18 @@
 - [x] parent 保存 child name、PID 與 command fd，並拒絕重複 child name。
 - [x] parent/child 在 fork 後關閉不使用的 pipe ends。
 - [x] root 結束時送出 `kill`、關閉 command fd、`waitpid()` child 並釋放 metadata。
-- [ ] 將 node command route 到正確的 direct child，並支援 child 建立自己的 child。
+- [x] 將 node command route 到正確的 direct child，並支援 child 建立自己的 child。
+- [x] child 透過 reply pipe 回傳 `OK`、`ERR`、`MISS` 或 fetch reply。
 - [ ] 完成 child 啟動失敗與 child 中途退出時的完整狀態回報。
 - [ ] 以 Linux toolchain 編譯並驗證 process/fd 行為。
 
 ### [ ] B-2. 完成 node 的輸入輸出
 
-- node 從自己的 command pipe 讀命令，回覆寫到自己的 reply pipe。
-- parent/child protocol 與 judge-facing stdout 分開管理，不能把內部訊息寫到
+- [x] node 從自己的 command pipe 讀命令，回覆寫到自己的 reply pipe。
+- [x] parent/child protocol 與 judge-facing stdout 分開管理，不能把內部訊息寫到
   judge reply channel。
-- 正確關閉每個 fork 後不使用的 pipe end；父程序要能觀察 child EOF。
-- 每個 node 都必須能持續接收命令，不能因一個 fetch 阻塞而停止讀其他命令。
+- [x] 正確關閉每個 fork 後不使用的 pipe end；父程序要能觀察 child EOF。
+- [ ] 每個 node 都必須能持續接收命令，不能因一個 fetch 阻塞而停止讀其他命令。
 
 ### [ ] B-3. 實作向上查找
 
@@ -323,6 +324,8 @@
 - [x] M1c：完成 EOF、read/allocation error、空 command、handler result 與
       cleanup 的處理。
 - [x] M2：root kill、錯誤處理與 Group 1 全部通過。
+- [x] M3a：single-node regression test 通過；B-1 開發沒有破壞
+      `store/delete/fetch/kill`。
 - [ ] M3：create、exec、FIFO 建立/開啟/清理。
 - [ ] M4：單一 ancestor lookup 與 route-based reply。
 - [ ] M5：多個 pending fetch 與 Group 2 全部通過。

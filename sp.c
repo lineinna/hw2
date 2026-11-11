@@ -26,6 +26,7 @@ typedef struct ChildNode {
   char *name;
   pid_t pid;
   int command_fd;
+  int reply_fd;
   struct ChildNode *next;
 } ChildNode;
 
@@ -40,6 +41,7 @@ static const char *program_path = NULL;
 static const char *current_node = "main";
 static int child_mode = 0;
 static int child_command_fd = -1;
+static int child_reply_fd = -1;
 static ChildNode *children = NULL;
 static Entry *find_entry(const char *key);
 static int set_entry(const char *key, const char *value);
@@ -61,6 +63,10 @@ static ChildNode *find_child(const char *name);
 static int spawn_child(const char *parent_name, const char *child_name);
 static void free_children(void);
 static int run_command_loop(int fd);
+static int command_target(const Command *command, char **target);
+static int normalize_local_command(const Command *command, char **buffer,
+                                   size_t *length);
+static int process_command(const Command *command);
 
 static int command_name_matches(const char *line, size_t line_len,
                                 const char *name) {
@@ -413,9 +419,11 @@ static ChildNode *find_child(const char *name) {
 
 static int spawn_child(const char *parent_name, const char *child_name) {
   int command_pipe[2] = {-1, -1};
+  int reply_pipe[2] = {-1, -1};
   int ready_pipe[2] = {-1, -1};
 
-  if (pipe(command_pipe) != 0 || pipe(ready_pipe) != 0) {
+  if (pipe(command_pipe) != 0 || pipe(reply_pipe) != 0 ||
+      pipe(ready_pipe) != 0) {
     perror("pipe");
     if (command_pipe[0] >= 0) {
       close(command_pipe[0]);
@@ -424,6 +432,10 @@ static int spawn_child(const char *parent_name, const char *child_name) {
     if (ready_pipe[0] >= 0) {
       close(ready_pipe[0]);
       close(ready_pipe[1]);
+    }
+    if (reply_pipe[0] >= 0) {
+      close(reply_pipe[0]);
+      close(reply_pipe[1]);
     }
     return -1;
   }
@@ -440,14 +452,17 @@ static int spawn_child(const char *parent_name, const char *child_name) {
 
   if (pid == 0) {
     char command_fd[32];
+    char reply_fd[32];
     char ready_fd[32];
     char *const arguments[] = {
         (char *)program_path, "--node", (char *)child_name, command_fd,
-        ready_fd, NULL};
+        reply_fd, ready_fd, NULL};
 
     close(command_pipe[1]);
+    close(reply_pipe[0]);
     close(ready_pipe[0]);
     snprintf(command_fd, sizeof(command_fd), "%d", command_pipe[0]);
+    snprintf(reply_fd, sizeof(reply_fd), "%d", reply_pipe[1]);
     snprintf(ready_fd, sizeof(ready_fd), "%d", ready_pipe[1]);
     execvp(program_path, arguments);
     perror("execvp");
@@ -455,16 +470,18 @@ static int spawn_child(const char *parent_name, const char *child_name) {
   }
 
   close(command_pipe[0]);
+  close(reply_pipe[1]);
   close(ready_pipe[1]);
 
   char *ready = NULL;
   size_t ready_length = 0;
   int read_result = read_line_from_fd(ready_pipe[0], &ready, &ready_length);
   close(ready_pipe[0]);
-  if (read_result != 0 || strcmp(ready, "READY") != 0) {
+  if (read_result != 0 || ready == NULL || strcmp(ready, "READY") != 0) {
     fprintf(stderr, "Child '%s' failed to initialize\n", child_name);
     free(ready);
     close(command_pipe[1]);
+    close(reply_pipe[0]);
     (void)waitpid(pid, NULL, 0);
     return -1;
   }
@@ -474,6 +491,7 @@ static int spawn_child(const char *parent_name, const char *child_name) {
   if (child == NULL) {
     perror("malloc");
     close(command_pipe[1]);
+    close(reply_pipe[0]);
     (void)waitpid(pid, NULL, 0);
     return -1;
   }
@@ -481,11 +499,13 @@ static int spawn_child(const char *parent_name, const char *child_name) {
   if (child->name == NULL) {
     free(child);
     close(command_pipe[1]);
+    close(reply_pipe[0]);
     (void)waitpid(pid, NULL, 0);
     return -1;
   }
   child->pid = pid;
   child->command_fd = command_pipe[1];
+  child->reply_fd = reply_pipe[0];
   child->next = children;
   children = child;
   (void)parent_name;
@@ -498,12 +518,224 @@ static void free_children(void) {
     ChildNode *next = child->next;
     (void)write_line(child->command_fd, "kill");
     close(child->command_fd);
+    close(child->reply_fd);
     (void)waitpid(child->pid, NULL, 0);
     free(child->name);
     free(child);
     child = next;
   }
   children = NULL;
+}
+
+static int command_target(const Command *command, char **target) {
+  const char *line = command->buf;
+  size_t name_length;
+  size_t first_start;
+  size_t first_end;
+  size_t second_start;
+  size_t second_end;
+
+  *target = NULL;
+  if (command->type == CREATE) {
+    char *child = NULL;
+    if (parse_two_keys(line, command->len, "create", target, &child) != 0) {
+      free(child);
+      return -1;
+    }
+    free(child);
+    return 0;
+  }
+
+  if (command->type == FETCH) {
+    char *key = NULL;
+    if (parse_two_keys(line, command->len, "fetch", target, &key) != 0) {
+      free(key);
+      return -1;
+    }
+    free(key);
+    return 0;
+  }
+
+  name_length = strlen(command->type == STORE
+                           ? "store"
+                           : command->type == DELETE ? "delete" : "kill");
+  first_start = name_length + 1;
+  if (command->len <= first_start) {
+    *target = duplicate_string(current_node);
+    return *target == NULL ? -1 : 0;
+  }
+
+  first_end = first_start;
+  while (first_end < command->len && line[first_end] != ' ') {
+    first_end++;
+  }
+  if (first_end == first_start) {
+    return -1;
+  }
+
+  if (command->type == KILL) {
+    if (first_end == command->len) {
+      *target = duplicate_string(first_start == command->len ? current_node
+                                                               : line + first_start);
+    } else {
+      *target = copy_range(line + first_start, first_end - first_start,
+                           target) == 0
+                    ? *target
+                    : NULL;
+    }
+    return *target == NULL ? -1 : 0;
+  }
+
+  if (first_end == command->len) {
+    *target = duplicate_string(current_node);
+    return *target == NULL ? -1 : 0;
+  }
+
+  second_start = first_end + 1;
+  second_end = second_start;
+  while (second_end < command->len && line[second_end] != ' ') {
+    second_end++;
+  }
+
+  if (command->type == DELETE) {
+    *target = copy_range(line + first_start, first_end - first_start, target)
+                  == 0
+              ? *target
+              : NULL;
+  } else if (command->type == STORE && second_end < command->len) {
+    *target = copy_range(line + first_start, first_end - first_start, target)
+                  == 0
+              ? *target
+              : NULL;
+  } else {
+    *target = duplicate_string(current_node);
+  }
+
+  return *target == NULL ? -1 : 0;
+}
+
+static int normalize_local_command(const Command *command, char **buffer,
+                                   size_t *length) {
+  const char *line = command->buf;
+  size_t name_length = strlen(command->type == STORE ? "store" : "delete");
+  size_t first_start = name_length + 1;
+  size_t first_end = first_start;
+  size_t second_start;
+  size_t second_end;
+
+  *buffer = NULL;
+  *length = 0;
+  if (command->type != STORE && command->type != DELETE) {
+    return copy_range(line, command->len, buffer) == 0
+               ? (*length = command->len, 0)
+               : -1;
+  }
+
+  while (first_end < command->len && line[first_end] != ' ') {
+    first_end++;
+  }
+  if (first_end == command->len) {
+    return copy_range(line, command->len, buffer) == 0
+               ? (*length = command->len, 0)
+               : -1;
+  }
+
+  second_start = first_end + 1;
+  second_end = second_start;
+  while (second_end < command->len && line[second_end] != ' ') {
+    second_end++;
+  }
+
+  if ((command->type == DELETE && second_end == command->len) ||
+      (command->type == STORE && second_end < command->len)) {
+    size_t tail_length = command->len - second_end;
+    size_t new_length = name_length + 1 + (second_end - second_start) +
+                        (command->type == STORE ? tail_length : 0);
+    char *normalized = malloc(new_length + 1);
+    if (normalized == NULL) {
+      return -1;
+    }
+    memcpy(normalized, line, name_length);
+    normalized[name_length] = ' ';
+    memcpy(normalized + name_length + 1, line + second_start,
+           second_end - second_start);
+    if (command->type == STORE) {
+      memcpy(normalized + name_length + 1 + second_end - second_start,
+             line + second_end, tail_length);
+    }
+    normalized[new_length] = '\0';
+    *buffer = normalized;
+    *length = new_length;
+    return 0;
+  }
+
+  return copy_range(line, command->len, buffer) == 0
+             ? (*length = command->len, 0)
+             : -1;
+}
+
+static int process_command(const Command *command) {
+  char *target = NULL;
+  if (command_target(command, &target) != 0) {
+    fprintf(stderr, "Invalid command target\n");
+    return -1;
+  }
+
+  if (strcmp(target, current_node) != 0) {
+    ChildNode *child = find_child(target);
+    if (child == NULL || write_line(child->command_fd, command->buf) != 0) {
+      free(target);
+      return -1;
+    }
+
+    char *response = NULL;
+    size_t response_length = 0;
+    int read_result =
+        read_line_from_fd(child->reply_fd, &response, &response_length);
+    if (read_result != 0) {
+      free(response);
+      free(target);
+      return -1;
+    }
+    if (child_mode) {
+      int result = write_line(child_reply_fd, response);
+      free(response);
+      free(target);
+      return result == 0 ? 0 : -1;
+    }
+    int result = 0;
+    if (strcmp(response, "ERR") == 0) {
+      result = -1;
+    } else if (strcmp(response, "MISS") == 0 ||
+               strcmp(response, "OK") == 0) {
+      result = strcmp(response, "MISS") == 0 ? 1 : 0;
+    } else if (printf("%s\n", response) < 0 || fflush(stdout) != 0) {
+      result = -1;
+    }
+    free(response);
+    free(target);
+    return result;
+  }
+
+  char *local_buffer = NULL;
+  size_t local_length = 0;
+  if (normalize_local_command(command, &local_buffer, &local_length) != 0) {
+    free(target);
+    return -1;
+  }
+  Command local_command = *command;
+  local_command.buf = local_buffer;
+  local_command.len = local_length;
+  int result = command_handler(&local_command);
+  free(local_buffer);
+
+  if (child_mode && command->type != FETCH) {
+    if (write_line(child_reply_fd, result < 0 ? "ERR" : "OK") != 0) {
+      result = -1;
+    }
+  }
+  free(target);
+  return result;
 }
 
 static int run_command_loop(int fd) {
@@ -530,7 +762,7 @@ static int run_command_loop(int fd) {
         .len = command_length,
         .type = classify_command(command_buffer, command_length),
     };
-    int handler_result = command_handler(&command);
+    int handler_result = process_command(&command);
     free(command_buffer);
 
     if (handler_result == 1 && command.type == KILL) {
@@ -641,7 +873,7 @@ int main(int argc, char *argv[]) {
 
   if (argc == 1) {
     current_node = "main";
-  } else if (argc == 5 && strcmp(argv[1], "--node") == 0) {
+  } else if (argc == 6 && strcmp(argv[1], "--node") == 0) {
     char *end = NULL;
     long command_fd = strtol(argv[3], &end, 10);
     if (*argv[3] == '\0' || *end != '\0' || command_fd < 0 ||
@@ -650,8 +882,15 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    long ready_fd = strtol(argv[4], &end, 10);
-    if (*argv[4] == '\0' || *end != '\0' || ready_fd < 0 ||
+    long reply_fd = strtol(argv[4], &end, 10);
+    if (*argv[4] == '\0' || *end != '\0' || reply_fd < 0 ||
+        reply_fd > INT_MAX) {
+      fprintf(stderr, "Invalid child reply fd\n");
+      return 1;
+    }
+
+    long ready_fd = strtol(argv[5], &end, 10);
+    if (*argv[5] == '\0' || *end != '\0' || ready_fd < 0 ||
         ready_fd > INT_MAX) {
       fprintf(stderr, "Invalid child ready fd\n");
       return 1;
@@ -660,6 +899,7 @@ int main(int argc, char *argv[]) {
     current_node = argv[2];
     child_mode = 1;
     child_command_fd = (int)command_fd;
+    child_reply_fd = (int)reply_fd;
     if (write_line((int)ready_fd, "READY") != 0) {
       perror("write child ready");
       close(child_command_fd);
@@ -676,6 +916,7 @@ int main(int argc, char *argv[]) {
                                                 : STDIN_FILENO);
   if (child_mode) {
     close(child_command_fd);
+    close(child_reply_fd);
   }
   free_children();
   free_table();
@@ -764,12 +1005,44 @@ int fetch_handler(char *buf, size_t len) {
 
   Entry *entry = find_entry(key);
   if (entry == NULL) {
+    if (child_mode && write_line(child_reply_fd, "MISS") != 0) {
+      perror("write fetch miss");
+      free(hash);
+      free(key);
+      return -1;
+    }
     free(hash);
     free(key);
     return 1;
   }
 
-  if (printf("%s %s\n", hash, entry->value) < 0 || fflush(stdout) != 0) {
+  if (child_mode) {
+    size_t hash_length = strlen(hash);
+    size_t value_length = strlen(entry->value);
+    if (hash_length > SIZE_MAX - value_length - 2) {
+      free(hash);
+      free(key);
+      return -1;
+    }
+    char *reply = malloc(hash_length + value_length + 2);
+    if (reply == NULL) {
+      free(hash);
+      free(key);
+      return -1;
+    }
+    memcpy(reply, hash, hash_length);
+    reply[hash_length] = ' ';
+    memcpy(reply + hash_length + 1, entry->value, value_length + 1);
+    int write_result = write_line(child_reply_fd, reply);
+    free(reply);
+    if (write_result != 0) {
+      perror("write fetch reply");
+      free(hash);
+      free(key);
+      return -1;
+    }
+  } else if (printf("%s %s\n", hash, entry->value) < 0 ||
+             fflush(stdout) != 0) {
     perror("write fetch reply");
     free(hash);
     free(key);
