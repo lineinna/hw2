@@ -84,7 +84,7 @@
 - 每個 node 都有獨立 table；不能用 shared memory、檔案或跨程序 cache 保存 value。
 - 所有 allocation、reallocation、字串複製與釋放都要檢查錯誤。
 
-### [ ] 2-3. 設計父子程序通訊資料結構
+### [x] 2-3. 設計父子程序通訊資料結構
 
 - 為每個 node 保存：
   - 子程序 PID。
@@ -164,34 +164,40 @@
       channel，並保存 FIFO path 供 kill 時 `unlink()`。
 - [x] 明確管理 fork/exec 後的 fd ownership，避免 child 繼承其他 node 的
       pipe/FIFO write end。
+- [x] 建立 parent-to-child 與 child-to-parent 雙向 protocol pipe，並保存
+      parent 端 fd。
 - [ ] 以 Linux toolchain 編譯並驗證 process、FIFO 與 fd 行為。
 
 ### [ ] B-2. 完成 node 的輸入輸出
 
-- [ ] node 從自己的 judge-facing command channel 讀命令，fetch 回覆寫到自己
+- [x] node 從自己的 judge-facing command channel 讀命令，fetch 回覆寫到自己
       的 judge-facing reply channel。
 - [x] parent/child protocol 與 judge-facing FIFO/STDIO 分開管理，不能把內部
       訊息寫到 judge reply channel。
-- [ ] protocol message 保留 fetch hash、key 與 request 方向/來源資訊，讓 reply
-      能沿唯一路徑返回原始 node。
-- [ ] 以 newline framing 和動態 buffer 處理 partial read/write、EINTR、EOF
-      與多筆訊息黏在同一個 pipe 的情況。
+- [x] protocol message 以 request id/hash、key、來源 child 與方向資訊保留
+      lookup state，讓 reply 能沿唯一路徑返回原始 node。
+- [ ] 以 nonblocking newline framing 和每個 channel 的動態 buffer 處理
+      partial read/write、EINTR、EAGAIN、EOF 與多筆訊息黏在同一個 pipe。
+- [x] 建立每條 parent protocol channel 的獨立動態 `ChannelBuffer`，並提供
+      nonblocking read 與逐行取出的基礎 helper。
 
 ### [ ] B-3. 實作向上查找
 
-- [ ] local hit：直接寫入 receiving node 的 reply FIFO/STDOUT。
-- [ ] local miss：非 root node 將 request 傳給 parent，parent 先查自己的
-      local table，再決定回覆或繼續往上。
+- [x] local hit：直接寫入 receiving node 的 reply FIFO/STDOUT。
+- [x] local miss：非 root node 將帶 request identity 的 lookup 傳給 parent；
+      parent 先查自己的 local table，再回覆或繼續向上。
+- [x] 每個 fetch 建立獨立 pending request state，支援同一 node 同時處理
+      多個 fetch；禁止在 handler 內 blocking 等 parent reply。
 - [ ] nearest ancestor wins：離 request node 最近的 ancestor 命中時不能繼續問更上層。
 - [ ] 不 cache ancestor value；每次 miss 都重新沿 parent route 查找。
 
 ### [ ] B-4. 實作向下回覆
 
-- [ ] request 往上傳時保留原始 hash 與來源 child/route。
-- [ ] value 回來時依 route 逐層往下傳，最後只有最初接收 fetch 的 node 寫
+- [x] request 往上傳時保留原始 hash 與來源 child/route。
+- [x] value 回來時依 route 逐層往下傳，最後只有最初接收 fetch 的 node 寫
   `<hash> <value>` 到 judge reply FIFO。
-- [ ] 中間 node 不可在自己的 reply pipe 額外輸出 judge reply。
-- [ ] 以 poll/select 同時監聽 judge channel、parent protocol 與 child protocol；
+- [x] 中間 node 不可在自己的 reply pipe 額外輸出 judge reply。
+- [x] 以 poll/select 同時監聽 judge channel、parent protocol 與 child protocol；
       不用 blocking read 等待單一 fetch 完成。
 
 ### [ ] B-5. Group 2 驗收

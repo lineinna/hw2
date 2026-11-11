@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -25,14 +26,28 @@ typedef struct {
   size_t capacity;
 } InputBuffer;
 
+typedef struct {
+  char *data;
+  size_t len;
+  size_t capacity;
+} ChannelBuffer;
+
 typedef struct Child {
   pid_t pid;
   char *command_fifo;
   char *reply_fifo;
-  int to_child_fd;
-  int from_child_fd;
+  int parent_write_fd;
+  int parent_read_fd;
+  ChannelBuffer input;
   struct Child *next;
 } Child;
+
+typedef struct PendingRequest {
+  char *hash;
+  char *key;
+  Child *return_child;
+  struct PendingRequest *next;
+} PendingRequest;
 
 enum {
   READ_LINE_OK = 0,
@@ -47,19 +62,29 @@ static int child_command_fd = -1;
 static int child_reply_fd = -1;
 static int parent_read_fd = -1;
 static int parent_write_fd = -1;
+static ChannelBuffer parent_input = {0};
+static PendingRequest *pending_requests = NULL;
 static char *child_command_fifo = NULL;
 static char *child_reply_fifo = NULL;
-static volatile sig_atomic_t stopping = 0;
 static const char *program_path = NULL;
+static volatile sig_atomic_t stopping = 0;
 static Entry *find_entry(const char *key);
 static int set_entry(const char *key, const char *value);
 static int remove_entry(const char *key);
 static void free_table(void);
 static void free_children(void);
-static int spawn_child(const char *command_fifo, const char *reply_fifo);
 static int read_command_line(int fd, InputBuffer *input, char **line,
                              size_t *line_len);
 static int copy_range(const char *source, size_t length, char **result);
+static void free_channel_buffer(ChannelBuffer *buffer);
+static int set_nonblocking(int fd);
+static int append_channel_data(int fd, ChannelBuffer *buffer);
+static int take_channel_line(ChannelBuffer *buffer, char **line);
+static void free_pending_requests(void);
+static int add_pending_request(const char *hash, const char *key,
+                               Child *return_child);
+static PendingRequest *find_pending_request(const char *hash);
+static void remove_pending_request(PendingRequest *request);
 CommandType classify_command(const char *line, size_t line_len);
 static int parse_key_value(const char *line, size_t line_len, const char *name,
                            char **key, char **value);
@@ -67,52 +92,6 @@ static int parse_single_key(const char *line, size_t line_len,
                             const char *name, char **key);
 static int parse_two_keys(const char *line, size_t line_len, const char *name,
                           char **first, char **second);
-
-static void stop_child(int signal_number) {
-  (void)signal_number;
-  stopping = 1;
-}
-
-static int install_child_signal_handler(void) {
-  struct sigaction action;
-  memset(&action, 0, sizeof(action));
-  action.sa_handler = stop_child;
-  if (sigemptyset(&action.sa_mask) != 0 ||
-      sigaction(SIGTERM, &action, NULL) != 0) {
-    return -1;
-  }
-  return 0;
-}
-
-static int duplicate_fifo_path(const char *path, char **copy) {
-  if (path[0] != '/') {
-    return -1;
-  }
-  return copy_range(path, strlen(path), copy);
-}
-
-static int set_close_on_exec(int fd) {
-  int flags = fcntl(fd, F_GETFD);
-  if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
-    return -1;
-  }
-  return 0;
-}
-
-static int protect_child_fds(void) {
-  if (child_mode &&
-      (set_close_on_exec(parent_read_fd) != 0 ||
-       set_close_on_exec(parent_write_fd) != 0)) {
-    return -1;
-  }
-  for (Child *child = children; child != NULL; child = child->next) {
-    if (set_close_on_exec(child->to_child_fd) != 0 ||
-        set_close_on_exec(child->from_child_fd) != 0) {
-      return -1;
-    }
-  }
-  return 0;
-}
 
 static int command_name_matches(const char *line, size_t line_len,
                                 const char *name) {
@@ -287,6 +266,178 @@ static int parse_two_keys(const char *line, size_t line_len, const char *name,
 
   return 0;
 }
+
+static void stop_child(int signal_number) {
+  (void)signal_number;
+  stopping = 1;
+}
+
+static int set_close_on_exec(int fd) {
+  int flags = fcntl(fd, F_GETFD);
+  if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static int valid_fifo_path(const char *path) {
+  return path[0] == '/' && strchr(path, ' ') == NULL &&
+         strchr(path, '\t') == NULL;
+}
+
+static int write_all(int fd, const char *data, size_t length) {
+  while (length > 0) {
+    ssize_t written = write(fd, data, length);
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (written <= 0) {
+      return -1;
+    }
+    data += written;
+    length -= (size_t)written;
+  }
+  return 0;
+}
+
+static int set_nonblocking(int fd) {
+  int flags = fcntl(fd, F_GETFL);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static void free_channel_buffer(ChannelBuffer *buffer) {
+  free(buffer->data);
+  buffer->data = NULL;
+  buffer->len = 0;
+  buffer->capacity = 0;
+}
+
+static int append_channel_data(int fd, ChannelBuffer *buffer) {
+  char chunk[4096];
+
+  for (;;) {
+    ssize_t count = read(fd, chunk, sizeof(chunk));
+    if (count < 0 && (errno == EINTR || errno == EAGAIN ||
+                      errno == EWOULDBLOCK)) {
+      return 0;
+    }
+    if (count < 0 || count == 0) {
+      return count == 0 ? 1 : -1;
+    }
+
+    size_t amount = (size_t)count;
+    if (buffer->len > SIZE_MAX - amount) {
+      return -1;
+    }
+    size_t required = buffer->len + amount;
+    if (required > buffer->capacity) {
+      size_t capacity = buffer->capacity == 0 ? 4096 : buffer->capacity;
+      while (capacity < required) {
+        if (capacity > SIZE_MAX / 2) {
+          capacity = required;
+          break;
+        }
+        capacity *= 2;
+      }
+      char *expanded = realloc(buffer->data, capacity);
+      if (expanded == NULL) {
+        return -1;
+      }
+      buffer->data = expanded;
+      buffer->capacity = capacity;
+    }
+    memcpy(buffer->data + buffer->len, chunk, amount);
+    buffer->len += amount;
+  }
+}
+
+static int take_channel_line(ChannelBuffer *buffer, char **line) {
+  char *newline = memchr(buffer->data, '\n', buffer->len);
+  if (newline == NULL) {
+    return 0;
+  }
+
+  size_t length = (size_t)(newline - buffer->data);
+  char *result = malloc(length + 1);
+  if (result == NULL) {
+    return -1;
+  }
+  memcpy(result, buffer->data, length);
+  result[length] = '\0';
+
+  size_t consumed = length + 1;
+  memmove(buffer->data, buffer->data + consumed, buffer->len - consumed);
+  buffer->len -= consumed;
+  *line = result;
+  return 1;
+}
+
+static void free_pending_requests(void) {
+  PendingRequest *request = pending_requests;
+  while (request != NULL) {
+    PendingRequest *next = request->next;
+    free(request->hash);
+    free(request->key);
+    free(request);
+    request = next;
+  }
+  pending_requests = NULL;
+}
+
+static int add_pending_request(const char *hash, const char *key,
+                               Child *return_child) {
+  PendingRequest *request = malloc(sizeof(*request));
+  if (request == NULL) {
+    return -1;
+  }
+  request->hash = NULL;
+  request->key = NULL;
+  request->return_child = return_child;
+  request->next = pending_requests;
+  if (copy_range(hash, strlen(hash), &request->hash) != 0 ||
+      copy_range(key, strlen(key), &request->key) != 0) {
+    free(request->hash);
+    free(request->key);
+    free(request);
+    return -1;
+  }
+  pending_requests = request;
+  return 0;
+}
+
+static PendingRequest *find_pending_request(const char *hash) {
+  for (PendingRequest *request = pending_requests; request != NULL;
+       request = request->next) {
+    if (strcmp(request->hash, hash) == 0) {
+      return request;
+    }
+  }
+  return NULL;
+}
+
+static void remove_pending_request(PendingRequest *request) {
+  PendingRequest **link = &pending_requests;
+  while (*link != NULL && *link != request) {
+    link = &(*link)->next;
+  }
+  if (*link == request) {
+    *link = request->next;
+    free(request->hash);
+    free(request->key);
+    free(request);
+  }
+}
+
+static int write_line_fd(int fd, const char *line) {
+  size_t length = strlen(line);
+  return write_all(fd, line, length) == 0 &&
+                 write_all(fd, "\n", 1) == 0
+             ? 0
+             : -1;
+}
 static Entry *find_entry(const char *key) {
   for (Entry *entry = table; entry != NULL; entry = entry->next) {
     if (strcmp(entry->key, key) == 0) {
@@ -365,25 +516,27 @@ static void free_children(void) {
   Child *child = children;
   while (child != NULL) {
     Child *next = child->next;
-    close(child->to_child_fd);
-    close(child->from_child_fd);
+    close(child->parent_write_fd);
+    close(child->parent_read_fd);
     if (kill(child->pid, SIGTERM) != 0 && errno != ESRCH) {
       perror("kill child");
     }
-    if (waitpid(child->pid, NULL, 0) < 0 && errno != ECHILD) {
-      perror("waitpid child");
+    while (waitpid(child->pid, NULL, 0) < 0 && errno == EINTR) {
     }
     free(child->command_fifo);
     free(child->reply_fifo);
+    free_channel_buffer(&child->input);
     free(child);
     child = next;
   }
   children = NULL;
+  free_pending_requests();
+  free_channel_buffer(&parent_input);
 }
 
 static int add_child(pid_t pid, const char *command_fifo,
-                     const char *reply_fifo, int to_child_fd,
-                     int from_child_fd) {
+                     const char *reply_fifo, int parent_write_fd_value,
+                     int parent_read_fd_value) {
   Child *child = malloc(sizeof(*child));
   if (child == NULL) {
     return -1;
@@ -391,18 +544,21 @@ static int add_child(pid_t pid, const char *command_fifo,
   child->pid = pid;
   child->command_fifo = NULL;
   child->reply_fifo = NULL;
-  child->to_child_fd = to_child_fd;
-  child->from_child_fd = from_child_fd;
+  child->parent_write_fd = parent_write_fd_value;
+  child->parent_read_fd = parent_read_fd_value;
+  child->input.data = NULL;
+  child->input.len = 0;
+  child->input.capacity = 0;
   child->next = children;
 
-  if (duplicate_fifo_path(command_fifo, &child->command_fifo) != 0 ||
-      duplicate_fifo_path(reply_fifo, &child->reply_fifo) != 0) {
+  if (copy_range(command_fifo, strlen(command_fifo), &child->command_fifo) !=
+          0 ||
+      copy_range(reply_fifo, strlen(reply_fifo), &child->reply_fifo) != 0) {
     free(child->command_fifo);
     free(child->reply_fifo);
     free(child);
     return -1;
   }
-
   children = child;
   return 0;
 }
@@ -410,9 +566,13 @@ static int add_child(pid_t pid, const char *command_fifo,
 static int spawn_child(const char *command_fifo, const char *reply_fifo) {
   int to_child[2] = {-1, -1};
   int from_child[2] = {-1, -1};
-  if (protect_child_fds() != 0) {
-    perror("fcntl child fd");
-    return -1;
+  for (Child *existing = children; existing != NULL;
+       existing = existing->next) {
+    if (set_close_on_exec(existing->parent_write_fd) != 0 ||
+        set_close_on_exec(existing->parent_read_fd) != 0) {
+      perror("fcntl");
+      return -1;
+    }
   }
   if (pipe(to_child) != 0 || pipe(from_child) != 0) {
     perror("pipe");
@@ -426,6 +586,15 @@ static int spawn_child(const char *command_fifo, const char *reply_fifo) {
     }
     return -1;
   }
+  if (set_close_on_exec(to_child[1]) != 0 ||
+      set_close_on_exec(from_child[0]) != 0) {
+    perror("fcntl");
+    close(to_child[0]);
+    close(to_child[1]);
+    close(from_child[0]);
+    close(from_child[1]);
+    return -1;
+  }
 
   pid_t pid = fork();
   if (pid < 0) {
@@ -436,48 +605,161 @@ static int spawn_child(const char *command_fifo, const char *reply_fifo) {
     close(from_child[1]);
     return -1;
   }
-
   if (pid == 0) {
-    char parent_read[32];
-    char parent_write[32];
-    (void)snprintf(parent_read, sizeof(parent_read), "%d", from_child[0]);
-    (void)snprintf(parent_write, sizeof(parent_write), "%d", to_child[1]);
-    close(to_child[0]);
-    close(from_child[1]);
+    char read_fd[32];
+    char write_fd[32];
+    (void)snprintf(read_fd, sizeof(read_fd), "%d", to_child[0]);
+    (void)snprintf(write_fd, sizeof(write_fd), "%d", from_child[1]);
+    close(to_child[1]);
+    close(from_child[0]);
     char *const child_argv[] = {
         (char *)program_path, (char *)"--node", (char *)command_fifo,
-        (char *)reply_fifo, parent_read, parent_write, NULL};
+        (char *)reply_fifo, read_fd, write_fd, NULL};
     execv(program_path, child_argv);
-    perror("exec sp child");
+    perror("exec child");
     _exit(127);
   }
 
-  close(to_child[1]);
-  close(from_child[0]);
-  if (set_close_on_exec(to_child[0]) != 0 ||
-      set_close_on_exec(from_child[1]) != 0) {
-    perror("fcntl child fd");
-    close(to_child[0]);
-    close(from_child[1]);
+  close(to_child[0]);
+  close(from_child[1]);
+  if (set_close_on_exec(to_child[1]) != 0 ||
+      set_close_on_exec(from_child[0]) != 0 ||
+      set_nonblocking(to_child[1]) != 0 ||
+      set_nonblocking(from_child[0]) != 0) {
+    perror("fcntl");
+    close(to_child[1]);
+    close(from_child[0]);
     if (kill(pid, SIGTERM) != 0 && errno != ESRCH) {
       perror("kill child");
     }
-    (void)waitpid(pid, NULL, 0);
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {
+    }
     return -1;
   }
-  if (add_child(pid, command_fifo, reply_fifo, to_child[0],
-                from_child[1]) != 0) {
-    close(to_child[0]);
-    close(from_child[1]);
+  if (add_child(pid, command_fifo, reply_fifo, to_child[1],
+                from_child[0]) != 0) {
     if (kill(pid, SIGTERM) != 0 && errno != ESRCH) {
       perror("kill child");
     }
-    if (waitpid(pid, NULL, 0) < 0 && errno != ECHILD) {
-      perror("waitpid child");
+    close(to_child[1]);
+    close(from_child[0]);
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {
     }
     return -1;
   }
   return 0;
+}
+
+static int send_lookup_request(int fd, const char *hash, const char *key) {
+  size_t length = 7 + strlen(hash) + 1 + strlen(key);
+  char *request = malloc(length + 1);
+  if (request == NULL) {
+    return -1;
+  }
+  (void)snprintf(request, length + 1, "LOOKUP %s %s", hash, key);
+  int result = write_line_fd(fd, request);
+  free(request);
+  return result;
+}
+
+static int send_value_response(int fd, const char *hash,
+                               const char *value) {
+  size_t length = 6 + strlen(hash) + 1 + strlen(value);
+  char *response = malloc(length + 1);
+  if (response == NULL) {
+    return -1;
+  }
+  (void)snprintf(response, length + 1, "VALUE %s %s", hash, value);
+  int result = write_line_fd(fd, response);
+  free(response);
+  return result;
+}
+
+static int handle_protocol_line(Child *source_child, const char *line) {
+  if (strncmp(line, "LOOKUP ", 7) == 0) {
+    const char *hash_start = line + 7;
+    const char *separator = strchr(hash_start, ' ');
+    char *hash = NULL;
+    char *key = NULL;
+    if (separator == NULL || separator == hash_start ||
+        separator[1] == '\0' ||
+        copy_range(hash_start, (size_t)(separator - hash_start), &hash) !=
+            0 ||
+        copy_range(separator + 1, strlen(separator + 1), &key) != 0 ||
+        strchr(key, ' ') != NULL) {
+      free(hash);
+      free(key);
+      return -1;
+    }
+
+    Entry *entry = find_entry(key);
+    int result;
+    if (entry != NULL) {
+      result = source_child == NULL
+                   ? send_value_response(parent_write_fd, hash, entry->value)
+                   : send_value_response(source_child->parent_write_fd, hash,
+                                         entry->value);
+    } else if (child_mode) {
+      result = add_pending_request(hash, key, source_child);
+      if (result == 0) {
+        result = send_lookup_request(parent_write_fd, hash, key);
+        if (result != 0) {
+          PendingRequest *request = find_pending_request(hash);
+          remove_pending_request(request);
+        }
+      }
+    } else {
+      result = -1;
+    }
+    remove_pending_request(request);
+    free(hash);
+    free(key);
+    return result;
+  }
+
+  if (strncmp(line, "VALUE ", 6) == 0) {
+    const char *hash_start = line + 6;
+    const char *separator = strchr(hash_start, ' ');
+    if (separator == NULL || separator == hash_start) {
+      return -1;
+    }
+    char *hash = NULL;
+    char *value = NULL;
+    if (copy_range(hash_start, (size_t)(separator - hash_start), &hash) !=
+            0 ||
+        copy_range(separator + 1, strlen(separator + 1), &value) != 0) {
+      free(hash);
+      free(value);
+      return -1;
+    }
+    PendingRequest *request = find_pending_request(hash);
+    if (request == NULL) {
+      free(hash);
+      free(value);
+      return -1;
+    }
+    int result;
+    if (request->return_child != NULL) {
+      result = send_value_response(request->return_child->parent_write_fd,
+                                   hash, value);
+    } else {
+      size_t length = strlen(hash) + 1 + strlen(value);
+      char *reply = malloc(length + 1);
+      if (reply != NULL) {
+        (void)snprintf(reply, length + 1, "%s %s", hash, value);
+        result = write_line_fd(child_mode ? child_reply_fd : STDOUT_FILENO,
+                               reply);
+        free(reply);
+      } else {
+        result = -1;
+      }
+    }
+    free(hash);
+    free(value);
+    return result;
+  }
+
+  return -1;
 }
 
 static int read_command_line(int fd, InputBuffer *input, char **line,
@@ -514,9 +796,6 @@ static int read_command_line(int fd, InputBuffer *input, char **line,
     ssize_t bytes_read = read(fd, chunk, sizeof(chunk));
     if (bytes_read < 0) {
       if (errno == EINTR) {
-        if (stopping) {
-          return READ_LINE_ERROR;
-        }
         continue;
       }
 
@@ -582,31 +861,38 @@ int main(int argc, char *argv[]) {
   if (argc == 6 && strcmp(argv[1], "--node") == 0) {
     char *end = NULL;
     long parsed_read_fd = strtol(argv[4], &end, 10);
-    if (*argv[4] == '\0' || *end != '\0' || parsed_read_fd < 0 ||
-        parsed_read_fd > INT_MAX) {
-      fprintf(stderr, "Invalid parent read fd\n");
-      return 1;
-    }
+    int read_fd_valid = *argv[4] != '\0' && *end == '\0' &&
+                        parsed_read_fd >= 0 && parsed_read_fd <= INT_MAX;
     long parsed_write_fd = strtol(argv[5], &end, 10);
-    if (*argv[5] == '\0' || *end != '\0' || parsed_write_fd < 0 ||
-        parsed_write_fd > INT_MAX) {
-      fprintf(stderr, "Invalid parent write fd\n");
+    int write_fd_valid = *argv[5] != '\0' && *end == '\0' &&
+                         parsed_write_fd >= 0 && parsed_write_fd <= INT_MAX;
+    if (!read_fd_valid || !write_fd_valid ||
+        !valid_fifo_path(argv[2]) || !valid_fifo_path(argv[3])) {
+      fprintf(stderr, "Invalid child arguments\n");
       return 1;
     }
+
     child_mode = 1;
     parent_read_fd = (int)parsed_read_fd;
     parent_write_fd = (int)parsed_write_fd;
-    if (duplicate_fifo_path(argv[2], &child_command_fifo) != 0 ||
-        duplicate_fifo_path(argv[3], &child_reply_fifo) != 0) {
-      fprintf(stderr, "Invalid FIFO path\n");
+    if (set_nonblocking(parent_read_fd) != 0 ||
+        set_nonblocking(parent_write_fd) != 0) {
+      perror("fcntl");
+      return 1;
+    }
+    if (copy_range(argv[2], strlen(argv[2]), &child_command_fifo) != 0 ||
+        copy_range(argv[3], strlen(argv[3]), &child_reply_fifo) != 0) {
+      fprintf(stderr, "Unable to copy FIFO path\n");
       free(child_command_fifo);
       free(child_reply_fifo);
       return 1;
     }
-    if (install_child_signal_handler() != 0) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = stop_child;
+    if (sigemptyset(&action.sa_mask) != 0 ||
+        sigaction(SIGTERM, &action, NULL) != 0) {
       perror("sigaction");
-      free(child_command_fifo);
-      free(child_reply_fifo);
       return 1;
     }
     if (mkfifo(child_command_fifo, 0600) != 0 ||
@@ -614,8 +900,6 @@ int main(int argc, char *argv[]) {
       perror("mkfifo");
       unlink(child_command_fifo);
       unlink(child_reply_fifo);
-      free(child_command_fifo);
-      free(child_reply_fifo);
       return 1;
     }
     child_command_fd = open(child_command_fifo, O_RDONLY);
@@ -623,8 +907,6 @@ int main(int argc, char *argv[]) {
       perror("open command FIFO");
       unlink(child_command_fifo);
       unlink(child_reply_fifo);
-      free(child_command_fifo);
-      free(child_reply_fifo);
       return 1;
     }
     child_reply_fd = open(child_reply_fifo, O_WRONLY);
@@ -633,8 +915,6 @@ int main(int argc, char *argv[]) {
       close(child_command_fd);
       unlink(child_command_fifo);
       unlink(child_reply_fifo);
-      free(child_command_fifo);
-      free(child_reply_fifo);
       return 1;
     }
   } else if (argc != 1) {
@@ -647,6 +927,105 @@ int main(int argc, char *argv[]) {
   int running = 1;
 
   while (running) {
+    size_t channel_count = 1 + (child_mode ? 1 : 0);
+    for (Child *child = children; child != NULL; child = child->next) {
+      channel_count++;
+    }
+    struct pollfd *poll_fds = calloc(channel_count, sizeof(*poll_fds));
+    Child **poll_children = calloc(channel_count, sizeof(*poll_children));
+    if (poll_fds == NULL || poll_children == NULL) {
+      free(poll_fds);
+      free(poll_children);
+      exit_status = 1;
+      break;
+    }
+
+    size_t poll_count = 0;
+    poll_fds[poll_count].fd =
+        child_mode ? child_command_fd : STDIN_FILENO;
+    poll_fds[poll_count].events = POLLIN;
+    poll_count++;
+    size_t parent_poll_index = SIZE_MAX;
+    if (child_mode) {
+      parent_poll_index = poll_count;
+      poll_fds[poll_count].fd = parent_read_fd;
+      poll_fds[poll_count].events = POLLIN;
+      poll_count++;
+    }
+    for (Child *child = children; child != NULL; child = child->next) {
+      poll_fds[poll_count].fd = child->parent_read_fd;
+      poll_fds[poll_count].events = POLLIN;
+      poll_children[poll_count] = child;
+      poll_count++;
+    }
+
+    int poll_result;
+    do {
+      poll_result = poll(poll_fds, poll_count, -1);
+    } while (poll_result < 0 && errno == EINTR);
+    if (poll_result < 0) {
+      perror("poll");
+      free(poll_fds);
+      free(poll_children);
+      exit_status = 1;
+      break;
+    }
+
+    if (child_mode && (poll_fds[parent_poll_index].revents & POLLIN)) {
+      int read_result = append_channel_data(parent_read_fd, &parent_input);
+      if (read_result < 0) {
+        exit_status = 1;
+        running = 0;
+      } else {
+        char *protocol_line = NULL;
+        while (take_channel_line(&parent_input, &protocol_line) == 1) {
+          if (handle_protocol_line(NULL, protocol_line) != 0) {
+            free(protocol_line);
+            exit_status = 1;
+            running = 0;
+            break;
+          }
+          free(protocol_line);
+          protocol_line = NULL;
+        }
+        free(protocol_line);
+      }
+    }
+
+    for (size_t index = 0; index < poll_count && running; index++) {
+      Child *source_child = poll_children[index];
+      if (source_child == NULL ||
+          !(poll_fds[index].revents & POLLIN)) {
+        continue;
+      }
+      int read_result =
+          append_channel_data(source_child->parent_read_fd,
+                              &source_child->input);
+      if (read_result < 0) {
+        exit_status = 1;
+        running = 0;
+        break;
+      }
+      char *protocol_line = NULL;
+      while (take_channel_line(&source_child->input, &protocol_line) == 1) {
+        if (handle_protocol_line(source_child, protocol_line) != 0) {
+          free(protocol_line);
+          exit_status = 1;
+          running = 0;
+          break;
+        }
+        free(protocol_line);
+        protocol_line = NULL;
+      }
+      free(protocol_line);
+    }
+
+    free(poll_fds);
+    free(poll_children);
+    if (!running) {
+      break;
+    }
+
     char *command_buffer = NULL;
     size_t command_length = 0;
     int read_result =
@@ -658,9 +1037,6 @@ int main(int argc, char *argv[]) {
       break;
     }
     if (read_result == READ_LINE_ERROR) {
-      if (stopping) {
-        break;
-      }
       exit_status = 1;
       break;
     }
@@ -718,7 +1094,8 @@ int create_handler(char *buf, size_t len) {
   char *command_fifo = NULL;
   char *reply_fifo = NULL;
 
-  if (parse_two_keys(buf, len, "create", &command_fifo, &reply_fifo) != 0) {
+  if (parse_two_keys(buf, len, "create", &command_fifo, &reply_fifo) != 0 ||
+      !valid_fifo_path(command_fifo) || !valid_fifo_path(reply_fifo)) {
     fprintf(stderr, "Invalid create command\n");
     free(command_fifo);
     free(reply_fifo);
@@ -774,18 +1151,39 @@ int fetch_handler(char *buf, size_t len) {
 
   Entry *entry = find_entry(key);
   if (entry == NULL) {
+    if (child_mode) {
+      int result = add_pending_request(hash, key, NULL);
+      if (result == 0) {
+        result = send_lookup_request(parent_write_fd, hash, key);
+      }
+      free(hash);
+      free(key);
+      return result;
+    }
     free(hash);
     free(key);
     return 1;
   }
 
-  if (printf("%s %s\n", hash, entry->value) < 0 || fflush(stdout) != 0) {
+  size_t reply_length = strlen(hash) + 1 + strlen(entry->value);
+  char *reply = malloc(reply_length + 1);
+  if (reply == NULL) {
+    perror("malloc");
+    free(hash);
+    free(key);
+    return 1;
+  }
+  (void)snprintf(reply, reply_length + 1, "%s %s", hash, entry->value);
+  int output_fd = child_mode ? child_reply_fd : STDOUT_FILENO;
+  if (write_line_fd(output_fd, reply) != 0) {
     perror("write fetch reply");
+    free(reply);
     free(hash);
     free(key);
     return -1;
   }
 
+  free(reply);
   free(hash);
   free(key);
   return 0;
