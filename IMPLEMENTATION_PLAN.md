@@ -154,13 +154,13 @@
 ### [ ] B-1. 實作 `create`
 
 - [x] 先保留 single-node 版本為 `sp_node_finish.c`，確保後續修改可回復。
-- [ ] 支援規格要求的 `create <command-fifo> <reply-fifo>`；不是 node name
+- [x] 支援規格要求的 `create <command-fifo> <reply-fifo>`；不是 node name
       routing，兩個 path 都是 absolute path 且不得包含 whitespace。
-- [ ] parent `fork()` 後由 child `exec()` 同一個 `sp`，確保 child 是
+- [x] parent `fork()` 後由 child `exec()` 同一個 `sp`，確保 child 是
       receiving node 的 direct child，且每個 create 只建立一個 process。
-- [ ] child 在開啟任一 FIFO 前先對兩個 path 執行 `mkfifo()`，再以 blocking
+- [x] child 在開啟任一 FIFO 前先對兩個 path 執行 `mkfifo()`，再以 blocking
       `open()` 等待 judge 開啟另一端。
-- [ ] child 開啟 command FIFO 作為 command channel、reply FIFO 作為 reply
+- [x] child 開啟 command FIFO 作為 command channel、reply FIFO 作為 reply
       channel，並保存 FIFO path 供 kill 時 `unlink()`。
 - [ ] 明確管理 fork/exec 後的 fd ownership，避免 child 繼承其他 node 的
       pipe/FIFO write end。
