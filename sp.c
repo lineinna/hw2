@@ -1261,24 +1261,12 @@ int delete_handler(char *buf, size_t len) {
 }
 
 int fetch_handler(char *buf, size_t len) {
-  char *node = NULL;
   char *hash = NULL;
   char *key = NULL;
-  int node_form =
-      parse_node_key(buf, len, "fetch", &node, &key) == 0;
 
-  if (!node_form && parse_two_keys(buf, len, "fetch", &hash, &key) != 0) {
+  if (parse_two_keys(buf, len, "fetch", &hash, &key) != 0) {
     fprintf(stderr, "Invalid fetch command\n");
-    free(node);
     return -1;
-  }
-  if (node_form) {
-    hash = duplicate_string(node);
-    free(node);
-    if (hash == NULL) {
-      free(key);
-      return -1;
-    }
   }
 
   Entry *entry = find_entry(key);
@@ -1295,14 +1283,6 @@ int fetch_handler(char *buf, size_t len) {
     free(hash);
     free(key);
     return 1;
-  }
-
-  if (node_form) {
-    int result = write_line_fd(child_mode ? child_reply_fd : STDOUT_FILENO,
-                               entry->value);
-    free(hash);
-    free(key);
-    return result;
   }
 
   size_t reply_length = strlen(hash) + 1 + strlen(entry->value);
