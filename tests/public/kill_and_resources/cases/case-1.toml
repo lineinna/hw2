@@ -1,0 +1,18 @@
+# Killing a subtree removes every node in it.
+command_timeout_ms = 5000
+strict_cleanup = true
+steps = '''
+create main a
+create a b
+create b c
+create main d
+store d k v
+kill a
+fetch d k
+'''
+
+[limits]
+processes = { soft = 9, hard = 18 }
+open_fds = { soft = 80, hard = 160 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

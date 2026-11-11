@@ -1,0 +1,15 @@
+# A child finds its parent's pair.
+command_timeout_ms = 5000
+steps = '''
+create main a
+store main k from-main
+fetch main k
+wait
+fetch a k
+'''
+
+[limits]
+processes = { soft = 6, hard = 12 }
+open_fds = { soft = 32, hard = 64 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

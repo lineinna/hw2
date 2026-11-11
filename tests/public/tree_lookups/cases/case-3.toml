@@ -1,0 +1,22 @@
+# A lookup climbs eight levels.
+command_timeout_ms = 5000
+steps = '''
+create main n2
+create n2 n3
+create n3 n4
+create n4 n5
+create n5 n6
+create n6 n7
+create n7 n8
+store main deep top
+fetch main deep
+wait
+fetch n8 deep
+fetch n5 deep
+'''
+
+[limits]
+processes = { soft = 12, hard = 24 }
+open_fds = { soft = 128, hard = 256 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

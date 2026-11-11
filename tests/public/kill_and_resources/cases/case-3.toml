@@ -1,0 +1,20 @@
+# A long value travels down the tree.
+command_timeout_ms = 5000
+strict_cleanup = true
+steps = '''
+create main a
+create a b
+store main big ${big}
+fetch main big
+wait
+fetch b big
+'''
+
+[limits]
+processes = { soft = 7, hard = 14 }
+open_fds = { soft = 48, hard = 96 }
+memory_kb = { soft = 32768, hard = 65536 }
+cpu_seconds = { soft = 5, hard = 10 }
+
+[strings]
+big = { len = 2000000 }

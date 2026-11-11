@@ -1,0 +1,53 @@
+# A full tree of 32 nodes answers and shuts down.
+command_timeout_ms = 5000
+strict_cleanup = true
+steps = '''
+create main c1
+create main c2
+create main c3
+create c1 n4
+create c1 n5
+create c2 n6
+create c2 n7
+create c3 n8
+create c3 n9
+create n4 n10
+create n4 n11
+create n5 n12
+create n5 n13
+create n6 n14
+create n6 n15
+create n7 n16
+create n7 n17
+create n8 n18
+create n8 n19
+create n9 n20
+create n9 n21
+create n10 n22
+create n10 n23
+create n11 n24
+create n11 n25
+create n12 n26
+create n12 n27
+create n13 n28
+create n13 n29
+create n14 n30
+create n14 n31
+store main top T
+fetch main top
+wait
+fetch n24 top
+fetch n25 top
+fetch n26 top
+fetch n27 top
+fetch n28 top
+fetch n29 top
+fetch n30 top
+fetch n31 top
+'''
+
+[limits]
+processes = { soft = 36, hard = 72 }
+open_fds = { soft = 512, hard = 1024 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

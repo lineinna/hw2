@@ -1,0 +1,14 @@
+# A deleted key can be stored again.
+command_timeout_ms = 5000
+steps = '''
+store main k old
+delete main k
+store main k new
+fetch main k
+'''
+
+[limits]
+processes = { soft = 5, hard = 10 }
+open_fds = { soft = 16, hard = 32 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

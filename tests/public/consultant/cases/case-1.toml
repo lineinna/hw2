@@ -1,0 +1,13 @@
+# A miss below SP main climbs to the consultant.
+command_timeout_ms = 5000
+steps = '''
+create main a
+create a b
+fetch b unknown
+'''
+
+[limits]
+processes = { soft = 7, hard = 14 }
+open_fds = { soft = 48, hard = 96 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

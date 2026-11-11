@@ -1,0 +1,16 @@
+# Siblings keep separate tables.
+command_timeout_ms = 5000
+steps = '''
+create main left
+create main right
+store left k L
+store right k R
+fetch left k
+fetch right k
+'''
+
+[limits]
+processes = { soft = 7, hard = 14 }
+open_fds = { soft = 48, hard = 96 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

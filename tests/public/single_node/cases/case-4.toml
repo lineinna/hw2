@@ -1,0 +1,17 @@
+# Several fetches in flight at once, answered in any order.
+command_timeout_ms = 5000
+steps = '''
+store main a 1
+store main b 2
+store main c 3
+fetch main c
+fetch main a
+fetch main b
+fetch main a
+'''
+
+[limits]
+processes = { soft = 5, hard = 10 }
+open_fds = { soft = 16, hard = 32 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

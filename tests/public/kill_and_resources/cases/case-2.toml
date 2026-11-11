@@ -1,0 +1,21 @@
+# A node created again after a kill starts with an empty table.
+command_timeout_ms = 5000
+strict_cleanup = true
+steps = '''
+create main a
+store a k first
+fetch a k
+wait
+kill a
+create main a
+fetch a k
+wait
+store a k second
+fetch a k
+'''
+
+[limits]
+processes = { soft = 7, hard = 14 }
+open_fds = { soft = 48, hard = 96 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

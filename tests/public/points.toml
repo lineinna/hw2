@@ -1,0 +1,31 @@
+name = "Public tests"
+version = "2"
+scope = "public"
+
+[groups.single_node]
+score = 7
+
+[groups.single_node.subgroups.cases]
+score = 7
+tests = "single_node/cases.toml"
+
+[groups.tree_lookups]
+score = 21
+
+[groups.tree_lookups.subgroups.cases]
+score = 21
+tests = "tree_lookups/cases.toml"
+
+[groups.consultant]
+score = 29
+
+[groups.consultant.subgroups.cases]
+score = 29
+tests = "consultant/cases.toml"
+
+[groups.kill_and_resources]
+score = 43
+
+[groups.kill_and_resources.subgroups.cases]
+score = 43
+tests = "kill_and_resources/cases.toml"

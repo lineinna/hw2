@@ -1,0 +1,25 @@
+# Leaves look up through shared ancestors at once.
+command_timeout_ms = 5000
+steps = '''
+create main a
+create main b
+create a a1
+create a a2
+create b b1
+store main shared S
+store a only-a A
+fetch main shared
+fetch a only-a
+wait
+fetch a1 shared
+fetch a2 shared
+fetch b1 shared
+fetch a1 only-a
+fetch a2 only-a
+'''
+
+[limits]
+processes = { soft = 10, hard = 20 }
+open_fds = { soft = 96, hard = 192 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

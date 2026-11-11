@@ -1,0 +1,27 @@
+# A failing consultant is retried.
+command_timeout_ms = 5000
+steps = '''
+update flaky
+fetch main proof
+wait
+create main a
+fetch a k
+wait
+update crashy
+fetch main proof
+wait
+fetch a k
+'''
+
+[limits]
+processes = { soft = 6, hard = 12 }
+open_fds = { soft = 32, hard = 64 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }
+
+[consultants.flaky]
+fail_first = 2
+
+[consultants.crashy]
+fail_first = 1
+fail_mode = "exit"

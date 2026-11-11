@@ -1,0 +1,20 @@
+# The nearest holder wins.
+command_timeout_ms = 5000
+steps = '''
+create main a
+create a b
+store main k root
+store a k middle
+fetch main k
+fetch a k
+wait
+fetch b k
+fetch a k
+fetch main k
+'''
+
+[limits]
+processes = { soft = 7, hard = 14 }
+open_fds = { soft = 48, hard = 96 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

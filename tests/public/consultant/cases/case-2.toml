@@ -1,0 +1,16 @@
+# Answers are not cached.
+command_timeout_ms = 5000
+steps = '''
+create main a
+fetch a k
+wait
+fetch a k
+wait
+fetch main k
+'''
+
+[limits]
+processes = { soft = 6, hard = 12 }
+open_fds = { soft = 32, hard = 64 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }

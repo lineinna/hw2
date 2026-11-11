@@ -1,0 +1,15 @@
+# Values keep their spaces.
+# The two trailing spaces after "world" are part of the value; do not trim them.
+command_timeout_ms = 5000
+steps = '''
+store main greeting  hello,  world  
+fetch main greeting
+store main path /a b/c
+fetch main path
+'''
+
+[limits]
+processes = { soft = 5, hard = 10 }
+open_fds = { soft = 16, hard = 32 }
+memory_kb = { soft = 65536, hard = 131072 }
+cpu_seconds = { soft = 5, hard = 10 }
