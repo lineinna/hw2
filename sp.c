@@ -67,12 +67,14 @@ static PendingRequest *pending_requests = NULL;
 static char *child_command_fifo = NULL;
 static char *child_reply_fifo = NULL;
 static const char *program_path = NULL;
+static char *consultant_path = NULL;
 static volatile sig_atomic_t stopping = 0;
 static Entry *find_entry(const char *key);
 static int set_entry(const char *key, const char *value);
 static int remove_entry(const char *key);
 static void free_table(void);
 static void free_children(void);
+static void remove_child(Child *target);
 static int read_command_line(int fd, InputBuffer *input, char **line,
                              size_t *line_len);
 static int copy_range(const char *source, size_t length, char **result);
@@ -85,6 +87,7 @@ static int add_pending_request(const char *hash, const char *key,
                                Child *return_child);
 static PendingRequest *find_pending_request(const char *hash);
 static void remove_pending_request(PendingRequest *request);
+static int run_consultant(const char *key, char **value);
 CommandType classify_command(const char *line, size_t line_len);
 static int parse_key_value(const char *line, size_t line_len, const char *name,
                            char **key, char **value);
@@ -532,6 +535,142 @@ static int write_line_fd(int fd, const char *line) {
              ? 0
              : -1;
 }
+
+static int read_line_blocking(int fd, char **line) {
+  char *data = NULL;
+  size_t length = 0;
+  size_t capacity = 0;
+  char chunk[4096];
+
+  for (;;) {
+    ssize_t count = read(fd, chunk, sizeof(chunk));
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      free(data);
+      return -1;
+    }
+    if (count == 0) {
+      free(data);
+      return 0;
+    }
+    size_t amount = (size_t)count;
+    if (length > SIZE_MAX - amount) {
+      free(data);
+      return -1;
+    }
+    size_t required = length + amount;
+    if (required > capacity) {
+      size_t new_capacity = capacity == 0 ? 4096 : capacity;
+      while (new_capacity < required) {
+        if (new_capacity > SIZE_MAX / 2) {
+          new_capacity = required;
+          break;
+        }
+        new_capacity *= 2;
+      }
+      char *expanded = realloc(data, new_capacity);
+      if (expanded == NULL) {
+        free(data);
+        return -1;
+      }
+      data = expanded;
+      capacity = new_capacity;
+    }
+    char *newline = memchr(chunk, '\n', amount);
+    size_t copied = newline == NULL ? amount
+                                    : (size_t)(newline - chunk);
+    memcpy(data + length, chunk, copied);
+    length += copied;
+    if (newline != NULL) {
+      char *result = realloc(data, length + 1);
+      if (result == NULL) {
+        free(data);
+        return -1;
+      }
+      result[length] = '\0';
+      *line = result;
+      return 1;
+    }
+  }
+}
+
+static int run_consultant(const char *key, char **value) {
+  *value = NULL;
+  if (consultant_path == NULL) {
+    fprintf(stderr, "JUDGE_CONSULTANT is not set\n");
+    return -1;
+  }
+
+  for (;;) {
+    int input_pipe[2] = {-1, -1};
+    int output_pipe[2] = {-1, -1};
+    if (pipe(input_pipe) != 0 || pipe(output_pipe) != 0) {
+      perror("pipe consultant");
+      if (input_pipe[0] >= 0) {
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+      }
+      if (output_pipe[0] >= 0) {
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+      }
+      return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+      perror("fork consultant");
+      close(input_pipe[0]);
+      close(input_pipe[1]);
+      close(output_pipe[0]);
+      close(output_pipe[1]);
+      return -1;
+    }
+    if (pid == 0) {
+      if (dup2(input_pipe[0], STDIN_FILENO) < 0 ||
+          dup2(output_pipe[1], STDOUT_FILENO) < 0) {
+        _exit(127);
+      }
+      for (Child *child = children; child != NULL; child = child->next) {
+        close(child->parent_write_fd);
+        close(child->parent_read_fd);
+      }
+      close(input_pipe[0]);
+      close(input_pipe[1]);
+      close(output_pipe[0]);
+      close(output_pipe[1]);
+      execl(consultant_path, consultant_path, (char *)NULL);
+      _exit(127);
+    }
+
+    close(input_pipe[0]);
+    close(output_pipe[1]);
+    int failed = write_line_fd(input_pipe[1], key) != 0;
+    if (close(input_pipe[1]) != 0) {
+      failed = 1;
+    }
+    char *response = NULL;
+    int response_result = failed ? -1 : read_line_blocking(output_pipe[0],
+                                                            &response);
+    close(output_pipe[0]);
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {
+    }
+
+    if (response_result == 1 && response != NULL &&
+        strncmp(response, "Ok: ", 4) == 0 && response[4] != '\0') {
+      int copy_result = copy_range(response + 4, strlen(response + 4), value);
+      free(response);
+      if (copy_result != 0) {
+        perror("malloc");
+        return -1;
+      }
+      return 0;
+    }
+    free(response);
+  }
+}
 static Entry *find_entry(const char *key) {
   for (Entry *entry = table; entry != NULL; entry = entry->next) {
     if (strcmp(entry->key, key) == 0) {
@@ -610,12 +749,14 @@ static void free_children(void) {
   Child *child = children;
   while (child != NULL) {
     Child *next = child->next;
-    close(child->parent_write_fd);
-    close(child->parent_read_fd);
-    if (kill(child->pid, SIGTERM) != 0 && errno != ESRCH) {
-      perror("kill child");
+    if (child->parent_write_fd >= 0) {
+      close(child->parent_write_fd);
+      child->parent_write_fd = -1;
     }
     while (waitpid(child->pid, NULL, 0) < 0 && errno == EINTR) {
+    }
+    if (child->parent_read_fd >= 0) {
+      close(child->parent_read_fd);
     }
     free(child->command_fifo);
     free(child->reply_fifo);
@@ -626,6 +767,30 @@ static void free_children(void) {
   children = NULL;
   free_pending_requests();
   free_channel_buffer(&parent_input);
+}
+
+static void remove_child(Child *target) {
+  Child **link = &children;
+  while (*link != NULL && *link != target) {
+    link = &(*link)->next;
+  }
+  if (*link != target) {
+    return;
+  }
+
+  *link = target->next;
+  if (target->parent_read_fd >= 0) {
+    close(target->parent_read_fd);
+  }
+  if (target->parent_write_fd >= 0) {
+    close(target->parent_write_fd);
+  }
+  while (waitpid(target->pid, NULL, 0) < 0 && errno == EINTR) {
+  }
+  free(target->command_fifo);
+  free(target->reply_fifo);
+  free_channel_buffer(&target->input);
+  free(target);
 }
 
 static int add_child(pid_t pid, const char *command_fifo,
@@ -718,7 +883,6 @@ static int spawn_child(const char *command_fifo, const char *reply_fifo) {
   close(from_child[1]);
   if (set_close_on_exec(to_child[1]) != 0 ||
       set_close_on_exec(from_child[0]) != 0 ||
-      set_nonblocking(to_child[1]) != 0 ||
       set_nonblocking(from_child[0]) != 0) {
     perror("fcntl");
     close(to_child[1]);
@@ -803,7 +967,15 @@ static int handle_protocol_line(Child *source_child, const char *line) {
         }
       }
     } else {
-      result = -1;
+      char *value = NULL;
+      result = run_consultant(key, &value);
+      if (result == 0) {
+        result = source_child == NULL
+                     ? send_value_response(STDOUT_FILENO, hash, value)
+                     : send_value_response(source_child->parent_write_fd,
+                                           hash, value);
+      }
+      free(value);
     }
     free(hash);
     free(key);
@@ -950,6 +1122,17 @@ static int read_command_line(int fd, InputBuffer *input, char **line,
   }
 }
 
+static int handle_command_line(char *line, size_t length) {
+  Command command = {
+      .buf = line,
+      .len = length,
+      .type = classify_command(line, length),
+  };
+  int result = command_handler(&command);
+  free(line);
+  return result == 1 && command.type == KILL ? 1 : 0;
+}
+
 int main(int argc, char *argv[]) {
   program_path = argv[0];
   if (argc == 6 && strcmp(argv[1], "--node") == 0) {
@@ -969,14 +1152,13 @@ int main(int argc, char *argv[]) {
     child_mode = 1;
     parent_read_fd = (int)parsed_read_fd;
     parent_write_fd = (int)parsed_write_fd;
-    if (set_nonblocking(parent_read_fd) != 0 ||
-        set_nonblocking(parent_write_fd) != 0) {
+    if (set_nonblocking(parent_read_fd) != 0) {
       perror("fcntl");
       return 1;
     }
     if (copy_range(argv[2], strlen(argv[2]), &child_command_fifo) != 0 ||
         copy_range(argv[3], strlen(argv[3]), &child_reply_fifo) != 0) {
-      fprintf(stderr, "Unable to copy FIFO path\n");
+      perror("malloc");
       free(child_command_fifo);
       free(child_reply_fifo);
       return 1;
@@ -996,7 +1178,7 @@ int main(int argc, char *argv[]) {
       unlink(child_reply_fifo);
       return 1;
     }
-    child_command_fd = open(child_command_fifo, O_RDONLY);
+    child_command_fd = open(child_command_fifo, O_RDWR | O_NONBLOCK);
     if (child_command_fd < 0) {
       perror("open command FIFO");
       unlink(child_command_fifo);
@@ -1015,40 +1197,30 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Usage: ./sp\n");
     return 1;
   }
+  if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+    perror("signal");
+    return 1;
+  }
+  if (!child_mode) {
+    const char *initial_consultant = getenv("JUDGE_CONSULTANT");
+    if (initial_consultant != NULL &&
+        copy_range(initial_consultant, strlen(initial_consultant),
+                   &consultant_path) != 0) {
+      perror("malloc");
+      return 1;
+    }
+  }
+
+  int command_fd = child_mode ? child_command_fd : STDIN_FILENO;
+  if (set_nonblocking(command_fd) != 0) {
+    perror("fcntl");
+    return 1;
+  }
 
   InputBuffer input = {0};
   int exit_status = 0;
   int running = 1;
-
-  while (running) {
-    if (!child_mode) {
-      char *command_buffer = NULL;
-      size_t command_length = 0;
-      int read_result = read_command_line(
-          STDIN_FILENO, &input, &command_buffer, &command_length);
-      if (read_result == READ_LINE_EOF) {
-        free(command_buffer);
-        break;
-      }
-      if (read_result == READ_LINE_ERROR) {
-        free(command_buffer);
-        exit_status = 1;
-        break;
-      }
-
-      Command command = {
-          .buf = command_buffer,
-          .len = command_length,
-          .type = classify_command(command_buffer, command_length),
-      };
-      int handler_result = command_handler(&command);
-      free(command_buffer);
-      if (handler_result == 1 && command.type == KILL) {
-        running = 0;
-      }
-      continue;
-    }
-
+  while (running && !stopping) {
     size_t channel_count = 1 + (child_mode ? 1 : 0);
     for (Child *child = children; child != NULL; child = child->next) {
       channel_count++;
@@ -1056,6 +1228,7 @@ int main(int argc, char *argv[]) {
     struct pollfd *poll_fds = calloc(channel_count, sizeof(*poll_fds));
     Child **poll_children = calloc(channel_count, sizeof(*poll_children));
     if (poll_fds == NULL || poll_children == NULL) {
+      perror("calloc");
       free(poll_fds);
       free(poll_children);
       exit_status = 1;
@@ -1063,22 +1236,19 @@ int main(int argc, char *argv[]) {
     }
 
     size_t poll_count = 0;
-    poll_fds[poll_count].fd =
-        child_mode ? child_command_fd : STDIN_FILENO;
-    poll_fds[poll_count].events = POLLIN;
-    poll_count++;
-    size_t parent_poll_index = SIZE_MAX;
+    size_t command_index = poll_count;
+    poll_fds[poll_count].fd = command_fd;
+    poll_fds[poll_count++].events = POLLIN;
+    size_t parent_index = SIZE_MAX;
     if (child_mode) {
-      parent_poll_index = poll_count;
+      parent_index = poll_count;
       poll_fds[poll_count].fd = parent_read_fd;
-      poll_fds[poll_count].events = POLLIN;
-      poll_count++;
+      poll_fds[poll_count++].events = POLLIN;
     }
     for (Child *child = children; child != NULL; child = child->next) {
       poll_fds[poll_count].fd = child->parent_read_fd;
       poll_fds[poll_count].events = POLLIN;
-      poll_children[poll_count] = child;
-      poll_count++;
+      poll_children[poll_count++] = child;
     }
 
     int poll_result;
@@ -1093,90 +1263,99 @@ int main(int argc, char *argv[]) {
       break;
     }
 
-    if (child_mode && (poll_fds[parent_poll_index].revents & POLLIN)) {
+    if (poll_fds[command_index].revents & (POLLIN | POLLHUP)) {
+      int read_result = append_channel_data(command_fd,
+                                            (ChannelBuffer *)&input);
+      if (read_result < 0) {
+        exit_status = 1;
+        running = 0;
+      } else {
+        char *line = NULL;
+        int line_result;
+        while ((line_result =
+                    take_channel_line((ChannelBuffer *)&input, &line)) == 1) {
+          if (handle_command_line(line, strlen(line)) != 0) {
+            running = 0;
+            break;
+          }
+          line = NULL;
+        }
+        free(line);
+        if (line_result < 0) {
+          exit_status = 1;
+          running = 0;
+        } else if (read_result == 1 &&
+                   input.len == 0) {
+          running = 0;
+        }
+      }
+    }
+
+    if (running && child_mode && parent_index != SIZE_MAX &&
+        (poll_fds[parent_index].revents & (POLLIN | POLLHUP))) {
       int read_result = append_channel_data(parent_read_fd, &parent_input);
       if (read_result < 0) {
         exit_status = 1;
         running = 0;
       } else {
-        char *protocol_line = NULL;
-        while (take_channel_line(&parent_input, &protocol_line) == 1) {
-          if (handle_protocol_line(NULL, protocol_line) != 0) {
-            free(protocol_line);
+        char *line = NULL;
+        int line_result;
+        while ((line_result = take_channel_line(&parent_input, &line)) == 1) {
+          if (handle_protocol_line(NULL, line) != 0) {
+            free(line);
             exit_status = 1;
             running = 0;
             break;
           }
-          free(protocol_line);
-          protocol_line = NULL;
+          free(line);
+          line = NULL;
         }
-        free(protocol_line);
+        free(line);
+        if (line_result < 0) {
+          exit_status = 1;
+          running = 0;
+        } else if (read_result == 1 && parent_input.len == 0) {
+          running = 0;
+        }
       }
     }
 
-    for (size_t index = 0; index < poll_count && running; index++) {
+    for (size_t index = 0; running && index < poll_count; index++) {
       Child *source_child = poll_children[index];
       if (source_child == NULL ||
-          !(poll_fds[index].revents & POLLIN)) {
+          !(poll_fds[index].revents & (POLLIN | POLLHUP))) {
         continue;
       }
-      int read_result =
-          append_channel_data(source_child->parent_read_fd,
-                              &source_child->input);
+      int read_result = append_channel_data(source_child->parent_read_fd,
+                                            &source_child->input);
       if (read_result < 0) {
         exit_status = 1;
         running = 0;
         break;
       }
-      char *protocol_line = NULL;
-      while (take_channel_line(&source_child->input, &protocol_line) == 1) {
-        if (handle_protocol_line(source_child, protocol_line) != 0) {
-          free(protocol_line);
+      char *line = NULL;
+      int line_result;
+      while ((line_result =
+                  take_channel_line(&source_child->input, &line)) == 1) {
+        if (handle_protocol_line(source_child, line) != 0) {
+          free(line);
           exit_status = 1;
           running = 0;
           break;
         }
-        free(protocol_line);
-        protocol_line = NULL;
+        free(line);
+        line = NULL;
       }
-      free(protocol_line);
+      free(line);
+      if (line_result < 0) {
+        exit_status = 1;
+        running = 0;
+      } else if (read_result == 1 && source_child->input.len == 0) {
+        remove_child(source_child);
+      }
     }
-
     free(poll_fds);
     free(poll_children);
-    if (!running) {
-      break;
-    }
-
-    if (poll_fds[0].revents & (POLLIN | POLLHUP)) {
-      char *command_buffer = NULL;
-      size_t command_length = 0;
-      int read_result = read_command_line(
-          child_mode ? child_command_fd : STDIN_FILENO, &input,
-          &command_buffer, &command_length);
-
-      if (read_result == READ_LINE_EOF) {
-        free(command_buffer);
-        break;
-      }
-      if (read_result == READ_LINE_ERROR) {
-        free(command_buffer);
-        exit_status = 1;
-        break;
-      }
-
-      Command command = {
-          .buf = command_buffer,
-          .len = command_length,
-          .type = classify_command(command_buffer, command_length),
-      };
-      int handler_result = command_handler(&command);
-      free(command_buffer);
-
-      if (handler_result == 1 && command.type == KILL) {
-        running = 0;
-      }
-    }
   }
 
   free(input.data);
@@ -1192,6 +1371,7 @@ int main(int argc, char *argv[]) {
     free(child_reply_fifo);
   }
   free_table();
+  free(consultant_path);
   return exit_status;
 }
 
@@ -1293,9 +1473,27 @@ int fetch_handler(char *buf, size_t len) {
       free(key);
       return result;
     }
+    char *value = NULL;
+    int result = run_consultant(key, &value);
+    if (result == 0) {
+      size_t reply_length = strlen(hash) + 1 + strlen(value);
+      char *reply = malloc(reply_length + 1);
+      if (reply == NULL) {
+        perror("malloc");
+        result = -1;
+      } else {
+        (void)snprintf(reply, reply_length + 1, "%s %s", hash, value);
+        result = write_line_fd(STDOUT_FILENO, reply);
+        if (result != 0) {
+          perror("write fetch reply");
+        }
+        free(reply);
+      }
+    }
+    free(value);
     free(hash);
     free(key);
-    return 1;
+    return result;
   }
 
   size_t reply_length = strlen(hash) + 1 + strlen(entry->value);
@@ -1330,8 +1528,19 @@ int kill_handler(char *buf, size_t len) {
 }
 
 int update_handler(char *buf, size_t len) {
-  // TODO: Implement the UPDATE command handler.
-  (void)buf;
-  (void)len;
-  return -1;
+  char *path = NULL;
+  struct stat path_stat;
+  if (child_mode || parse_single_key(buf, len, "update", &path) != 0) {
+    fprintf(stderr, "Invalid update command\n");
+    free(path);
+    return -1;
+  }
+  if (stat(path, &path_stat) != 0 || !S_ISREG(path_stat.st_mode) ||
+      access(path, X_OK) != 0) {
+    free(path);
+    return 0;
+  }
+  free(consultant_path);
+  consultant_path = path;
+  return 0;
 }
