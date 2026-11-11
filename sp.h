@@ -3,12 +3,23 @@
 
 #include <stdio.h>
 
+typedef enum {
+  CREATE,
+  STORE,
+  DELETE,
+  FETCH,
+  KILL,
+  UPDATE,
+  UNKNOWN
+} CommandType;
+
 typedef struct {
   char *buf;
   size_t len;
-  enum { CREATE, STORE, DELETE, FETCH, KILL, UPDATE, UNKNOWN } type;
+  CommandType type;
 } Command;
 
+CommandType classify_command(const char *buf, size_t len);
 int command_handler(Command *cmd);
 int create_handler(char *buf, size_t len);
 int store_handler(char *buf, size_t len);
