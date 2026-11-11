@@ -32,7 +32,7 @@ static int remove_entry(const char *key);
 static void free_table(void);
 static int read_command_line(int fd, InputBuffer *input, char **line,
                              size_t *line_len);
-static int classify_command(const char *line, size_t line_len);
+CommandType classify_command(const char *line, size_t line_len);
 static int parse_key_value(const char *line, size_t line_len, const char *name,
                            char **key, char **value);
 static int parse_single_key(const char *line, size_t line_len,
@@ -51,7 +51,7 @@ static int command_name_matches(const char *line, size_t line_len,
   return line_len == name_len || line[name_len] == ' ';
 }
 
-static int classify_command(const char *line, size_t line_len) {
+CommandType classify_command(const char *line, size_t line_len) {
   if (command_name_matches(line, line_len, "create")) {
     return CREATE;
   }
