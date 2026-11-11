@@ -634,10 +634,9 @@ static int create_handler(const char *buf, size_t len) {
     return -1;
   }
 
-  set_cloexec(p_to_c[0]);
+  /* Parent ends must have CLOEXEC so further child processes do not inherit them */
   set_cloexec(p_to_c[1]);
   set_cloexec(c_to_p[0]);
-  set_cloexec(c_to_p[1]);
 
   pid_t pid = fork();
   if (pid < 0) {
@@ -653,30 +652,15 @@ static int create_handler(const char *buf, size_t len) {
 
   if (pid == 0) {
     /* Child process */
-    int in_fd = p_to_c[0];
-    int out_fd = c_to_p[1];
-    if (in_fd == 4) {
-      in_fd = dup(in_fd);
-      close(p_to_c[0]);
-    }
-    if (out_fd == 3) {
-      out_fd = dup(out_fd);
-      close(c_to_p[1]);
-    }
-    if (dup2(in_fd, 3) < 0 || dup2(out_fd, 4) < 0) {
-      perror("dup2");
-      _exit(127);
-    }
-    if (in_fd != 3) {
-      close(in_fd);
-    }
-    if (out_fd != 4) {
-      close(out_fd);
-    }
     close(p_to_c[1]);
     close(c_to_p[0]);
 
-    execl(g_node.self_path, "sp", "--child", cmd_fifo, reply_fifo, (char *)NULL);
+    char in_str[16];
+    char out_str[16];
+    snprintf(in_str, sizeof(in_str), "%d", p_to_c[0]);
+    snprintf(out_str, sizeof(out_str), "%d", c_to_p[1]);
+
+    execl(g_node.self_path, "sp", "--child", cmd_fifo, reply_fifo, in_str, out_str, (char *)NULL);
     perror("execl");
     _exit(127);
   }
@@ -968,13 +952,13 @@ int main(int argc, char *argv[]) {
 
   get_self_exe_path(g_node.self_path, sizeof(g_node.self_path), argv[0]);
 
-  if (argc >= 4 && strcmp(argv[1], "--child") == 0) {
+  if (argc >= 6 && strcmp(argv[1], "--child") == 0) {
     /* Child Mode */
     g_node.is_root = 0;
     g_node.cmd_fifo_path = duplicate_string(argv[2]);
     g_node.reply_fifo_path = duplicate_string(argv[3]);
-    g_node.from_parent_fd = 3;
-    g_node.to_parent_fd = 4;
+    g_node.from_parent_fd = atoi(argv[4]);
+    g_node.to_parent_fd = atoi(argv[5]);
 
     set_cloexec(g_node.from_parent_fd);
     set_cloexec(g_node.to_parent_fd);
@@ -988,19 +972,20 @@ int main(int argc, char *argv[]) {
       perror("mkfifo reply");
     }
 
-    g_node.cmd_fd = open(g_node.cmd_fifo_path, O_RDONLY | O_CLOEXEC);
-    if (g_node.cmd_fd < 0) {
-      perror("open cmd fifo");
-      cleanup_and_exit(1);
-    }
+    /* Open reply FIFO for writing first to rendezvous with judge's reader thread */
     g_node.reply_fd = open(g_node.reply_fifo_path, O_WRONLY | O_CLOEXEC);
     if (g_node.reply_fd < 0) {
       perror("open reply fifo");
       cleanup_and_exit(1);
     }
+    g_node.cmd_fd = open(g_node.cmd_fifo_path, O_RDONLY | O_CLOEXEC);
+    if (g_node.cmd_fd < 0) {
+      perror("open cmd fifo");
+      cleanup_and_exit(1);
+    }
 
-    set_nonblocking(g_node.cmd_fd);
     set_nonblocking(g_node.reply_fd);
+    set_nonblocking(g_node.cmd_fd);
   } else {
     /* Root (SP main) Mode */
     g_node.is_root = 1;
@@ -1010,6 +995,7 @@ int main(int argc, char *argv[]) {
     g_node.to_parent_fd = -1;
 
     set_nonblocking(STDIN_FILENO);
+    set_nonblocking(STDOUT_FILENO);
   }
 
   lb_init(&g_node.cmd_in_buf);
@@ -1177,7 +1163,7 @@ int main(int argc, char *argv[]) {
         if (curr->to_child_fd >= 0) {
           close(curr->to_child_fd);
         }
-        waitpid(curr->pid, NULL, 0);
+        waitpid(curr->pid, NULL, WNOHANG);
         remove_child_node(curr);
       }
 
