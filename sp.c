@@ -69,6 +69,9 @@ static int read_line_from_fd(int fd, char **line, size_t *line_len);
 static ChildNode *find_child(const char *name);
 static ChildNode *find_route(const char *name);
 static int add_route(const char *name, ChildNode *child);
+static void remove_routes_for_child(ChildNode *child);
+static int reap_child(ChildNode *child);
+static int remove_child(const char *name);
 static int spawn_child(const char *parent_name, const char *child_name);
 static void free_children(void);
 static void free_routes(void);
@@ -437,6 +440,10 @@ static ChildNode *find_route(const char *name) {
 }
 
 static int add_route(const char *name, ChildNode *child) {
+  if (find_route(name) != NULL) {
+    return -1;
+  }
+
   Route *route = malloc(sizeof(*route));
   if (route == NULL) {
     return -1;
@@ -450,6 +457,57 @@ static int add_route(const char *name, ChildNode *child) {
   route->next = routes;
   routes = route;
   return 0;
+}
+
+static void remove_routes_for_child(ChildNode *child) {
+  Route **route = &routes;
+
+  while (*route != NULL) {
+    if ((*route)->child == child) {
+      Route *removed = *route;
+      *route = removed->next;
+      free(removed->name);
+      free(removed);
+    } else {
+      route = &(*route)->next;
+    }
+  }
+}
+
+static int reap_child(ChildNode *child) {
+  int status;
+  pid_t result;
+
+  close(child->command_fd);
+  close(child->reply_fd);
+  do {
+    result = waitpid(child->pid, &status, 0);
+  } while (result < 0 && errno == EINTR);
+
+  return result == child->pid ? 0 : -1;
+}
+
+static int remove_child(const char *name) {
+  ChildNode **child = &children;
+
+  while (*child != NULL) {
+    if (strcmp((*child)->name, name) == 0) {
+      ChildNode *removed = *child;
+      *child = removed->next;
+      remove_routes_for_child(removed);
+      if (reap_child(removed) != 0) {
+        free(removed->name);
+        free(removed);
+        return -1;
+      }
+      free(removed->name);
+      free(removed);
+      return 0;
+    }
+    child = &(*child)->next;
+  }
+
+  return -1;
 }
 
 static int spawn_child(const char *parent_name, const char *child_name) {
@@ -480,6 +538,8 @@ static int spawn_child(const char *parent_name, const char *child_name) {
     perror("fork");
     close(command_pipe[0]);
     close(command_pipe[1]);
+    close(reply_pipe[0]);
+    close(reply_pipe[1]);
     close(ready_pipe[0]);
     close(ready_pipe[1]);
     return -1;
@@ -493,6 +553,10 @@ static int spawn_child(const char *parent_name, const char *child_name) {
         (char *)program_path, "--node", (char *)child_name, command_fd,
         reply_fd, ready_fd, NULL};
 
+    if (child_mode) {
+      close(child_command_fd);
+      close(child_reply_fd);
+    }
     close(command_pipe[1]);
     close(reply_pipe[0]);
     close(ready_pipe[0]);
@@ -561,9 +625,7 @@ static void free_children(void) {
   while (child != NULL) {
     ChildNode *next = child->next;
     (void)write_line(child->command_fd, "kill");
-    close(child->command_fd);
-    close(child->reply_fd);
-    (void)waitpid(child->pid, NULL, 0);
+    (void)reap_child(child);
     free(child->name);
     free(child);
     child = next;
@@ -747,6 +809,9 @@ static int process_command(const Command *command) {
   if (strcmp(target, current_node) != 0) {
     ChildNode *child = find_route(target);
     if (child == NULL || write_line(child->command_fd, command->buf) != 0) {
+      if (child != NULL) {
+        (void)remove_child(child->name);
+      }
       free(target);
       return -1;
     }
@@ -756,6 +821,7 @@ static int process_command(const Command *command) {
     int read_result =
         read_line_from_fd(child->reply_fd, &response, &response_length);
     if (read_result != 0) {
+      (void)remove_child(child->name);
       free(response);
       free(target);
       return -1;
@@ -768,7 +834,7 @@ static int process_command(const Command *command) {
       }
     }
 
-    if (command->type == FETCH && strncmp(response, "MISS ", 5) == 0) {
+    if (command->type == FETCH && strncmp(response, "MISS", 4) == 0) {
       char *hash = NULL;
       char *key = NULL;
       if (parse_two_keys(command->buf, command->len, "fetch", &hash, &key) ==
@@ -793,6 +859,14 @@ static int process_command(const Command *command) {
       }
       free(hash);
       free(key);
+    }
+
+    if (command->type == KILL && strcmp(response, "OK") == 0) {
+      if (remove_child(target) != 0) {
+        free(response);
+        free(target);
+        return -1;
+      }
     }
 
     if (child_mode) {

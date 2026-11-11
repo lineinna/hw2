@@ -151,7 +151,7 @@
 
 ## [ ] 4. 大步驟 B：完成 Group 2（21 分）
 
-### [x] B-1. 實作 `create`
+### [ ] B-1. 實作 `create`
 
 - [x] 先保留 single-node 版本為 `sp_node_finish.c`，確保後續修改可回復。
 - [x] 支援 `create <parent-node> <child-node>` 的 parser 與 parent name 驗證。
@@ -164,10 +164,16 @@
 - [x] root 結束時送出 `kill`、關閉 command fd、`waitpid()` child 並釋放 metadata。
 - [x] 將 node command route 到正確的 direct child，並支援 child 建立自己的 child。
 - [x] child 透過 reply pipe 回傳 `OK`、`ERR`、`MISS` 或 fetch reply。
-- [ ] 完成 child 啟動失敗與 child 中途退出時的完整狀態回報。
+- [x] `kill <node>` 成功後由 parent `waitpid()`、關閉 fd、移除 child metadata
+      與所有 descendant route。
+- [x] nested child `exec()` 前關閉 inherited parent protocol fd。
+- [x] child command write/read 發生 EOF 或 pipe error 時，parent 會移除失效
+      child、關閉 fd 並 reap process。
+- [x] 建立 route 時拒絕已存在的 node name。
+- [ ] 完成 child 啟動失敗時對 judge 的明確錯誤回報。
 - [ ] 以 Linux toolchain 編譯並驗證 process/fd 行為。
 
-### [x] B-2. 完成 node 的輸入輸出
+### [ ] B-2. 完成 node 的輸入輸出
 
 - [x] node 從自己的 command pipe 讀命令，回覆寫到自己的 reply pipe。
 - [x] parent/child protocol 與 judge-facing stdout 分開管理，不能把內部訊息寫到
@@ -176,20 +182,20 @@
 - [x] 每個 node 都能以目前的 framed line protocol 持續接收命令；
       多 request 非同步處理仍留待 Group 4。
 
-### [x] B-3. 實作向上查找
+### [ ] B-3. 實作向上查找
 
-- [x] local hit：直接產生 fetch result。
-- [x] local miss：非 root node 將 request 傳給 parent，parent 先查自己的
+- [ ] local hit：直接產生 fetch result。
+- [ ] local miss：非 root node 將 request 傳給 parent，parent 先查自己的
       local table，再決定回覆或繼續往上。
-- [x] nearest ancestor wins：離 request node 最近的 ancestor 命中時不能繼續問更上層。
-- [x] 不 cache ancestor value；每次 miss 都重新沿 parent route 查找。
+- [ ] nearest ancestor wins：離 request node 最近的 ancestor 命中時不能繼續問更上層。
+- [ ] 不 cache ancestor value；每次 miss 都重新沿 parent route 查找。
 
-### [x] B-4. 實作向下回覆
+### [ ] B-4. 實作向下回覆
 
-- [x] request 往上傳時保留原始 hash 與來源 child/route。
-- [x] value 回來時依 route 逐層往下傳，最後只有最初接收 fetch 的 node 寫
+- [ ] request 往上傳時保留原始 hash 與來源 child/route。
+- [ ] value 回來時依 route 逐層往下傳，最後只有最初接收 fetch 的 node 寫
   `<hash> <value>` 到 judge reply FIFO。
-- [x] 中間 node 不可在自己的 reply pipe 額外輸出 judge reply。
+- [ ] 中間 node 不可在自己的 reply pipe 額外輸出 judge reply。
 - [ ] 多個 request 可同時在同一條 parent-child path 上流動；目前同步
       request/reply 版本不涵蓋 Group 4 的真正並行。
 
