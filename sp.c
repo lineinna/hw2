@@ -318,7 +318,7 @@ static void free_table(void) {
 }
 
 /* ========================================================================= */
-/* Child Process Representation and Pending Request Tracking                 */
+/* Child Process, Consultant, and Pending Request Tracking                   */
 /* ========================================================================= */
 
 typedef struct ChildNode {
@@ -329,6 +329,17 @@ typedef struct ChildNode {
   OutputBuffer out_buf;
   struct ChildNode *next;
 } ChildNode;
+
+typedef struct ConsultantRun {
+  pid_t pid;
+  int from_consultant_fd;
+  LineBuffer in_buf;
+  char *hash;
+  char *key;
+  int got_ok;
+  int failed;
+  struct ConsultantRun *next;
+} ConsultantRun;
 
 typedef enum {
   CLIENT_JUDGE,
@@ -357,8 +368,10 @@ typedef struct {
   OutputBuffer parent_out_buf;
 
   ChildNode *children;
+  ConsultantRun *consultants;
   PendingReq *pending_reqs;
 
+  char *consultant_path;
   char *cmd_fifo_path;
   char *reply_fifo_path;
 
@@ -427,6 +440,27 @@ static void remove_child_node(ChildNode *target) {
   }
 }
 
+static void remove_consultant_run(ConsultantRun *target) {
+  ConsultantRun *prev = NULL;
+  ConsultantRun *curr = g_node.consultants;
+  while (curr != NULL) {
+    if (curr == target) {
+      if (prev == NULL) {
+        g_node.consultants = curr->next;
+      } else {
+        prev->next = curr->next;
+      }
+      lb_free(&curr->in_buf);
+      free(curr->hash);
+      free(curr->key);
+      free(curr);
+      return;
+    }
+    prev = curr;
+    curr = curr->next;
+  }
+}
+
 /* ========================================================================= */
 /* FD Utilities                                                              */
 /* ========================================================================= */
@@ -455,6 +489,166 @@ static void get_self_exe_path(char *path, size_t size, const char *argv0) {
     strncpy(path, argv0, size - 1);
     path[size - 1] = '\0';
   }
+}
+
+/* ========================================================================= */
+/* Consultant Execution and Retry                                            */
+/* ========================================================================= */
+
+static int start_consultant(const char *hash, const char *key) {
+  if (g_node.consultant_path == NULL) {
+    return -1;
+  }
+
+  int in_pipe[2];
+  int out_pipe[2];
+
+  if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
+    perror("pipe consultant");
+    return -1;
+  }
+
+  set_cloexec(in_pipe[1]);
+  set_cloexec(out_pipe[0]);
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork consultant");
+    close(in_pipe[0]);
+    close(in_pipe[1]);
+    close(out_pipe[0]);
+    close(out_pipe[1]);
+    return -1;
+  }
+
+  if (pid == 0) {
+    /* Child: consultant process */
+    if (dup2(in_pipe[0], STDIN_FILENO) < 0 || dup2(out_pipe[1], STDOUT_FILENO) < 0) {
+      perror("dup2 consultant");
+      _exit(127);
+    }
+    close(in_pipe[0]);
+    close(in_pipe[1]);
+    close(out_pipe[0]);
+    close(out_pipe[1]);
+
+    execl(g_node.consultant_path, g_node.consultant_path, (char *)NULL);
+    perror("execl consultant");
+    _exit(127);
+  }
+
+  /* Parent: SP main */
+  close(in_pipe[0]);
+  close(out_pipe[1]);
+
+  /* Write <key>\n to consultant stdin, then close stdin pipe */
+  size_t klen = strlen(key);
+  ssize_t nw = write(in_pipe[1], key, klen);
+  (void)nw;
+  nw = write(in_pipe[1], "\n", 1);
+  (void)nw;
+  close(in_pipe[1]);
+
+  set_nonblocking(out_pipe[0]);
+
+  ConsultantRun *c = malloc(sizeof(*c));
+  if (c == NULL) {
+    perror("malloc consultant");
+    close(out_pipe[0]);
+    return -1;
+  }
+
+  c->pid = pid;
+  c->from_consultant_fd = out_pipe[0];
+  lb_init(&c->in_buf);
+  c->hash = duplicate_string(hash);
+  c->key = duplicate_string(key);
+  c->got_ok = 0;
+  c->failed = 0;
+  c->next = g_node.consultants;
+  g_node.consultants = c;
+
+  return 0;
+}
+
+/* ========================================================================= */
+/* Consultant Execution and Retry                                            */
+/* ========================================================================= */
+
+static int start_consultant(const char *hash, const char *key) {
+  if (g_node.consultant_path == NULL) {
+    return -1;
+  }
+
+  int in_pipe[2];
+  int out_pipe[2];
+
+  if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
+    perror("pipe consultant");
+    return -1;
+  }
+
+  set_cloexec(in_pipe[1]);
+  set_cloexec(out_pipe[0]);
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork consultant");
+    close(in_pipe[0]);
+    close(in_pipe[1]);
+    close(out_pipe[0]);
+    close(out_pipe[1]);
+    return -1;
+  }
+
+  if (pid == 0) {
+    /* Child: consultant process */
+    if (dup2(in_pipe[0], STDIN_FILENO) < 0 || dup2(out_pipe[1], STDOUT_FILENO) < 0) {
+      perror("dup2 consultant");
+      _exit(127);
+    }
+    close(in_pipe[0]);
+    close(in_pipe[1]);
+    close(out_pipe[0]);
+    close(out_pipe[1]);
+
+    execl(g_node.consultant_path, g_node.consultant_path, (char *)NULL);
+    perror("execl consultant");
+    _exit(127);
+  }
+
+  /* Parent: SP main */
+  close(in_pipe[0]);
+  close(out_pipe[1]);
+
+  /* Write <key>\n to consultant stdin, then close stdin pipe */
+  size_t klen = strlen(key);
+  ssize_t nw = write(in_pipe[1], key, klen);
+  (void)nw;
+  nw = write(in_pipe[1], "\n", 1);
+  (void)nw;
+  close(in_pipe[1]);
+
+  set_nonblocking(out_pipe[0]);
+
+  ConsultantRun *c = malloc(sizeof(*c));
+  if (c == NULL) {
+    perror("malloc consultant");
+    close(out_pipe[0]);
+    return -1;
+  }
+
+  c->pid = pid;
+  c->from_consultant_fd = out_pipe[0];
+  lb_init(&c->in_buf);
+  c->hash = duplicate_string(hash);
+  c->key = duplicate_string(key);
+  c->got_ok = 0;
+  c->failed = 0;
+  c->next = g_node.consultants;
+  g_node.consultants = c;
+
+  return 0;
 }
 
 /* ========================================================================= */
@@ -766,11 +960,33 @@ static int fetch_handler(const char *buf, size_t len) {
     free(key);
     return 0;
   } else {
-    /* Miss at SP main: Consultant will be hooked in Stage D */
+    /* Miss at SP main: run consultant */
+    add_pending_req(hash, CLIENT_JUDGE, -1);
+    start_consultant(hash, key);
     free(hash);
     free(key);
     return 0;
   }
+}
+
+static int update_handler(const char *buf, size_t len) {
+  if (!g_node.is_root) {
+    return 0;
+  }
+
+  char *path = NULL;
+  if (parse_single_key(buf, len, "update", &path) != 0) {
+    return -1;
+  }
+
+  struct stat st;
+  if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0) {
+    free(g_node.consultant_path);
+    g_node.consultant_path = duplicate_string(path);
+  }
+
+  free(path);
+  return 0;
 }
 
 static void trigger_termination(void) {
@@ -803,8 +1019,7 @@ static int dispatch_command(const char *line, size_t len) {
     trigger_termination();
     return 0;
   case UPDATE:
-    /* Consultant update in Stage D */
-    return 0;
+    return update_handler(line, len);
   default:
     fprintf(stderr, "Unknown command\n");
     return -1;
@@ -842,7 +1057,9 @@ static void handle_child_msg(ChildNode *child, const char *line, size_t len) {
             free(msg);
           }
         } else {
-          /* Consultant in Stage D */
+          /* Miss at SP main: run consultant */
+          add_pending_req(hash, CLIENT_CHILD, child->to_child_fd);
+          start_consultant(hash, key);
         }
       }
       free(hash);
@@ -938,6 +1155,18 @@ static void cleanup_and_exit(int exit_code) {
     g_node.pending_reqs = next;
   }
 
+  while (g_node.consultants != NULL) {
+    ConsultantRun *next = g_node.consultants->next;
+    close(g_node.consultants->from_consultant_fd);
+    waitpid(g_node.consultants->pid, NULL, WNOHANG);
+    lb_free(&g_node.consultants->in_buf);
+    free(g_node.consultants->hash);
+    free(g_node.consultants->key);
+    free(g_node.consultants);
+    g_node.consultants = next;
+  }
+
+  free(g_node.consultant_path);
   free_table();
   exit(exit_code);
 }
@@ -996,6 +1225,9 @@ int main(int argc, char *argv[]) {
 
     set_nonblocking(STDIN_FILENO);
     set_nonblocking(STDOUT_FILENO);
+
+    const char *env_c = getenv("JUDGE_CONSULTANT");
+    g_node.consultant_path = env_c ? duplicate_string(env_c) : duplicate_string("./consultant");
   }
 
   lb_init(&g_node.cmd_in_buf);
@@ -1004,7 +1236,7 @@ int main(int argc, char *argv[]) {
   outbuf_init(&g_node.parent_out_buf);
 
   for (;;) {
-    if (g_node.is_terminating && g_node.children == NULL) {
+    if (g_node.is_terminating && g_node.children == NULL && g_node.consultants == NULL) {
       cleanup_and_exit(0);
     }
 
@@ -1012,6 +1244,9 @@ int main(int argc, char *argv[]) {
     int max_pfds = 4;
     for (ChildNode *c = g_node.children; c != NULL; c = c->next) {
       max_pfds += 2;
+    }
+    for (ConsultantRun *c = g_node.consultants; c != NULL; c = c->next) {
+      max_pfds += 1;
     }
 
     struct pollfd *pfds = malloc(sizeof(struct pollfd) * max_pfds);
@@ -1072,6 +1307,16 @@ int main(int argc, char *argv[]) {
       if (c->to_child_fd >= 0 && outbuf_has_pending(&c->out_buf)) {
         pfds[npfds].fd = c->to_child_fd;
         pfds[npfds].events = POLLOUT;
+        pfds[npfds].revents = 0;
+        npfds++;
+      }
+    }
+
+    /* 5. Consultant channels (SP main only) */
+    for (ConsultantRun *c = g_node.consultants; c != NULL; c = c->next) {
+      if (c->from_consultant_fd >= 0) {
+        pfds[npfds].fd = c->from_consultant_fd;
+        pfds[npfds].events = POLLIN;
         pfds[npfds].revents = 0;
         npfds++;
       }
@@ -1168,6 +1413,168 @@ int main(int argc, char *argv[]) {
       }
 
       curr = next;
+    }
+
+    /* Check each consultant (SP main only) */
+    ConsultantRun *c_curr = g_node.consultants;
+    while (c_curr != NULL) {
+      ConsultantRun *c_next = c_curr->next;
+      int consultant_done = 0;
+
+      for (int i = 0; i < npfds; i++) {
+        if (pfds[i].fd == c_curr->from_consultant_fd && (pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) {
+          int eof = 0;
+          lb_read_from_fd(&c_curr->in_buf, c_curr->from_consultant_fd, &eof);
+
+          char *line = NULL;
+          size_t line_len = 0;
+          while (lb_pop_line(&c_curr->in_buf, &line, &line_len) == 1) {
+            if (line_len >= 4 && memcmp(line, "Ok: ", 4) == 0) {
+              char *val = line + 4;
+              c_curr->got_ok = 1;
+
+              PendingReq *req = find_and_remove_pending_req(c_curr->hash);
+              if (req != NULL) {
+                if (req->client_type == CLIENT_JUDGE) {
+                  size_t hlen = strlen(c_curr->hash);
+                  size_t vlen = strlen(val);
+                  size_t msg_len = hlen + 1 + vlen + 1;
+                  char *msg = malloc(msg_len + 1);
+                  if (msg != NULL) {
+                    snprintf(msg, msg_len + 1, "%s %s\n", c_curr->hash, val);
+                    send_to_stream(g_node.reply_fd, &g_node.reply_out_buf, msg, msg_len);
+                    free(msg);
+                  }
+                } else if (req->client_type == CLIENT_CHILD) {
+                  ChildNode *target_child = find_child_by_to_fd(req->child_to_fd);
+                  if (target_child != NULL) {
+                    size_t hlen = strlen(c_curr->hash);
+                    size_t vlen = strlen(val);
+                    size_t msg_len = 2 + hlen + 1 + vlen + 1;
+                    char *msg = malloc(msg_len + 1);
+                    if (msg != NULL) {
+                      snprintf(msg, msg_len + 1, "A %s %s\n", c_curr->hash, val);
+                      send_to_stream(target_child->to_child_fd, &target_child->out_buf, msg, msg_len);
+                      free(msg);
+                    }
+                  }
+                }
+                free(req->hash);
+                free(req);
+              }
+              consultant_done = 1;
+            } else if (line_len >= 4 && memcmp(line, "Err:", 4) == 0) {
+              c_curr->failed = 1;
+              consultant_done = 1;
+            }
+            free(line);
+          }
+
+          if (eof) {
+            consultant_done = 1;
+          }
+        }
+      }
+
+      if (consultant_done) {
+        close(c_curr->from_consultant_fd);
+        waitpid(c_curr->pid, NULL, 0);
+
+        if (!c_curr->got_ok) {
+          /* Failed or premature EOF: retry for the same key */
+          char *h = duplicate_string(c_curr->hash);
+          char *k = duplicate_string(c_curr->key);
+          remove_consultant_run(c_curr);
+          start_consultant(h, k);
+          free(h);
+          free(k);
+        } else {
+          remove_consultant_run(c_curr);
+        }
+      }
+
+      c_curr = c_next;
+    }
+
+    /* Check each consultant (SP main only) */
+    ConsultantRun *c_curr = g_node.consultants;
+    while (c_curr != NULL) {
+      ConsultantRun *c_next = c_curr->next;
+      int consultant_done = 0;
+
+      for (int i = 0; i < npfds; i++) {
+        if (pfds[i].fd == c_curr->from_consultant_fd && (pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) {
+          int eof = 0;
+          lb_read_from_fd(&c_curr->in_buf, c_curr->from_consultant_fd, &eof);
+
+          char *line = NULL;
+          size_t line_len = 0;
+          while (lb_pop_line(&c_curr->in_buf, &line, &line_len) == 1) {
+            if (line_len >= 4 && memcmp(line, "Ok: ", 4) == 0) {
+              char *val = line + 4;
+              c_curr->got_ok = 1;
+
+              PendingReq *req = find_and_remove_pending_req(c_curr->hash);
+              if (req != NULL) {
+                if (req->client_type == CLIENT_JUDGE) {
+                  size_t hlen = strlen(c_curr->hash);
+                  size_t vlen = strlen(val);
+                  size_t msg_len = hlen + 1 + vlen + 1;
+                  char *msg = malloc(msg_len + 1);
+                  if (msg != NULL) {
+                    snprintf(msg, msg_len + 1, "%s %s\n", c_curr->hash, val);
+                    send_to_stream(g_node.reply_fd, &g_node.reply_out_buf, msg, msg_len);
+                    free(msg);
+                  }
+                } else if (req->client_type == CLIENT_CHILD) {
+                  ChildNode *target_child = find_child_by_to_fd(req->child_to_fd);
+                  if (target_child != NULL) {
+                    size_t hlen = strlen(c_curr->hash);
+                    size_t vlen = strlen(val);
+                    size_t msg_len = 2 + hlen + 1 + vlen + 1;
+                    char *msg = malloc(msg_len + 1);
+                    if (msg != NULL) {
+                      snprintf(msg, msg_len + 1, "A %s %s\n", c_curr->hash, val);
+                      send_to_stream(target_child->to_child_fd, &target_child->out_buf, msg, msg_len);
+                      free(msg);
+                    }
+                  }
+                }
+                free(req->hash);
+                free(req);
+              }
+              consultant_done = 1;
+            } else if (line_len >= 4 && memcmp(line, "Err:", 4) == 0) {
+              c_curr->failed = 1;
+              consultant_done = 1;
+            }
+            free(line);
+          }
+
+          if (eof) {
+            consultant_done = 1;
+          }
+        }
+      }
+
+      if (consultant_done) {
+        close(c_curr->from_consultant_fd);
+        waitpid(c_curr->pid, NULL, 0);
+
+        if (!c_curr->got_ok) {
+          /* Failed or premature EOF: retry for the same key */
+          char *h = duplicate_string(c_curr->hash);
+          char *k = duplicate_string(c_curr->key);
+          remove_consultant_run(c_curr);
+          start_consultant(h, k);
+          free(h);
+          free(k);
+        } else {
+          remove_consultant_run(c_curr);
+        }
+      }
+
+      c_curr = c_next;
     }
 
     free(pfds);
