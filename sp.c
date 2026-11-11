@@ -481,6 +481,67 @@ static int set_nonblocking(int fd) {
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+static void close_if_open(int *fd) {
+  if (fd == NULL || *fd < 0) {
+    return;
+  }
+  close(*fd);
+  *fd = -1;
+}
+
+static void close_unneeded_fds(int keep_a, int keep_b) {
+  long maxfd = sysconf(_SC_OPEN_MAX);
+  if (maxfd <= 0 || maxfd > 4096) {
+    maxfd = 4096;
+  }
+  for (int fd = 0; fd < (int)maxfd; fd++) {
+    if (fd == keep_a || fd == keep_b || fd == STDERR_FILENO) {
+      continue;
+    }
+    close(fd);
+  }
+}
+
+static int write_all(int fd, const char *data, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    ssize_t n = write(fd, data + off, len - off);
+    if (n > 0) {
+      off += (size_t)n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    return -1;
+  }
+  return 0;
+}
+
+static void wait_pid_blocking(pid_t pid) {
+  if (pid <= 0) {
+    return;
+  }
+  int status;
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR) {
+      break;
+    }
+  }
+}
+
+static void unlink_node_fifos(void) {
+  if (g_node.is_root) {
+    return;
+  }
+  if (g_node.cmd_fifo_path != NULL) {
+    unlink(g_node.cmd_fifo_path);
+  }
+  if (g_node.reply_fifo_path != NULL) {
+    unlink(g_node.reply_fifo_path);
+  }
+}
+
 static void get_self_exe_path(char *path, size_t size, const char *argv0) {
   ssize_t len = readlink("/proc/self/exe", path, size - 1);
   if (len > 0) {
@@ -527,10 +588,7 @@ static int start_consultant(const char *hash, const char *key) {
       perror("dup2 consultant");
       _exit(127);
     }
-    close(in_pipe[0]);
-    close(in_pipe[1]);
-    close(out_pipe[0]);
-    close(out_pipe[1]);
+    close_unneeded_fds(STDIN_FILENO, STDOUT_FILENO);
 
     execl(g_node.consultant_path, g_node.consultant_path, (char *)NULL);
     perror("execl consultant");
@@ -542,11 +600,10 @@ static int start_consultant(const char *hash, const char *key) {
   close(out_pipe[1]);
 
   /* Write <key>\n to consultant stdin, then close stdin pipe */
-  size_t klen = strlen(key);
-  ssize_t nw = write(in_pipe[1], key, klen);
-  (void)nw;
-  nw = write(in_pipe[1], "\n", 1);
-  (void)nw;
+  if (write_all(in_pipe[1], key, strlen(key)) != 0 ||
+      write_all(in_pipe[1], "\n", 1) != 0) {
+    /* Consultant still runs; treat as a failed run via stdout EOF. */
+  }
   close(in_pipe[1]);
 
   set_nonblocking(out_pipe[0]);
@@ -765,9 +822,10 @@ static int create_handler(const char *buf, size_t len) {
   }
 
   if (pid == 0) {
-    /* Child process */
+    /* Child process: keep only the parent-pipe ends that survive exec. */
     close(p_to_c[1]);
     close(c_to_p[0]);
+    close_unneeded_fds(p_to_c[0], c_to_p[1]);
 
     char in_str[16];
     char out_str[16];
@@ -909,6 +967,20 @@ static int update_handler(const char *buf, size_t len) {
   return 0;
 }
 
+static void abort_consultants(void) {
+  ConsultantRun *c = g_node.consultants;
+  while (c != NULL) {
+    ConsultantRun *next = c->next;
+    close_if_open(&c->from_consultant_fd);
+    if (c->pid > 0) {
+      kill(c->pid, SIGKILL);
+      wait_pid_blocking(c->pid);
+    }
+    remove_consultant_run(c);
+    c = next;
+  }
+}
+
 static void trigger_termination(void) {
   if (g_node.is_terminating) {
     return;
@@ -917,11 +989,11 @@ static void trigger_termination(void) {
 
   /* Tell all children to terminate by closing write pipes */
   for (ChildNode *c = g_node.children; c != NULL; c = c->next) {
-    if (c->to_child_fd >= 0) {
-      close(c->to_child_fd);
-      c->to_child_fd = -1;
-    }
+    close_if_open(&c->to_child_fd);
   }
+
+  /* SP main must not leave consultant runs alive after kill. */
+  abort_consultants();
 }
 
 static int dispatch_command(const char *line, size_t len) {
@@ -1037,31 +1109,16 @@ static void cleanup_and_exit(int exit_code) {
     outbuf_flush(&g_node.reply_out_buf, g_node.reply_fd);
   }
 
-  if (g_node.cmd_fd >= 0) {
-    close(g_node.cmd_fd);
-  }
-  if (g_node.reply_fd >= 0) {
-    close(g_node.reply_fd);
-  }
-  if (g_node.from_parent_fd >= 0) {
-    close(g_node.from_parent_fd);
-  }
-  if (g_node.to_parent_fd >= 0) {
-    close(g_node.to_parent_fd);
-  }
+  unlink_node_fifos();
+  free(g_node.cmd_fifo_path);
+  free(g_node.reply_fifo_path);
+  g_node.cmd_fifo_path = NULL;
+  g_node.reply_fifo_path = NULL;
 
-  if (!g_node.is_root) {
-    if (g_node.cmd_fifo_path != NULL) {
-      unlink(g_node.cmd_fifo_path);
-      free(g_node.cmd_fifo_path);
-      g_node.cmd_fifo_path = NULL;
-    }
-    if (g_node.reply_fifo_path != NULL) {
-      unlink(g_node.reply_fifo_path);
-      free(g_node.reply_fifo_path);
-      g_node.reply_fifo_path = NULL;
-    }
-  }
+  close_if_open(&g_node.cmd_fd);
+  close_if_open(&g_node.reply_fd);
+  close_if_open(&g_node.from_parent_fd);
+  close_if_open(&g_node.to_parent_fd);
 
   lb_free(&g_node.cmd_in_buf);
   outbuf_free(&g_node.reply_out_buf);
@@ -1075,16 +1132,15 @@ static void cleanup_and_exit(int exit_code) {
     g_node.pending_reqs = next;
   }
 
-  while (g_node.consultants != NULL) {
-    ConsultantRun *next = g_node.consultants->next;
-    close(g_node.consultants->from_consultant_fd);
-    waitpid(g_node.consultants->pid, NULL, WNOHANG);
-    lb_free(&g_node.consultants->in_buf);
-    free(g_node.consultants->hash);
-    free(g_node.consultants->key);
-    free(g_node.consultants);
-    g_node.consultants = next;
+  while (g_node.children != NULL) {
+    ChildNode *c = g_node.children;
+    close_if_open(&c->from_child_fd);
+    close_if_open(&c->to_child_fd);
+    wait_pid_blocking(c->pid);
+    remove_child_node(c);
   }
+
+  abort_consultants();
 
   free(g_node.consultant_path);
   free_table();
@@ -1098,6 +1154,10 @@ static void cleanup_and_exit(int exit_code) {
 int main(int argc, char *argv[]) {
   signal(SIGPIPE, SIG_IGN);
   memset(&g_node, 0, sizeof(g_node));
+  g_node.cmd_fd = -1;
+  g_node.reply_fd = -1;
+  g_node.from_parent_fd = -1;
+  g_node.to_parent_fd = -1;
 
   get_self_exe_path(g_node.self_path, sizeof(g_node.self_path), argv[0]);
 
@@ -1135,6 +1195,7 @@ int main(int argc, char *argv[]) {
 
     set_nonblocking(g_node.reply_fd);
     set_nonblocking(g_node.cmd_fd);
+    unlink_node_fifos();
   } else {
     /* Root (SP main) Mode */
     g_node.is_root = 1;
@@ -1145,6 +1206,8 @@ int main(int argc, char *argv[]) {
 
     set_nonblocking(STDIN_FILENO);
     set_nonblocking(STDOUT_FILENO);
+    set_cloexec(STDIN_FILENO);
+    set_cloexec(STDOUT_FILENO);
 
     const char *env_c = getenv("JUDGE_CONSULTANT");
     g_node.consultant_path = env_c ? duplicate_string(env_c) : duplicate_string("./consultant");
@@ -1242,6 +1305,14 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    if (npfds == 0) {
+      free(pfds);
+      if (g_node.is_terminating) {
+        cleanup_and_exit(0);
+      }
+      cleanup_and_exit(1);
+    }
+
     int ret = poll(pfds, npfds, -1);
     if (ret < 0) {
       free(pfds);
@@ -1268,7 +1339,9 @@ int main(int argc, char *argv[]) {
       char *line = NULL;
       size_t line_len = 0;
       while (lb_pop_line(&g_node.cmd_in_buf, &line, &line_len) == 1) {
-        dispatch_command(line, line_len);
+        if (!g_node.is_terminating) {
+          dispatch_command(line, line_len);
+        }
         free(line);
       }
 
@@ -1276,6 +1349,7 @@ int main(int argc, char *argv[]) {
         if (g_node.is_root) {
           trigger_termination();
         }
+        close_if_open(&g_node.cmd_fd);
       }
     }
 
@@ -1286,13 +1360,16 @@ int main(int argc, char *argv[]) {
       char *line = NULL;
       size_t line_len = 0;
       while (lb_pop_line(&g_node.parent_in_buf, &line, &line_len) == 1) {
-        handle_parent_msg(line, line_len);
+        if (!g_node.is_terminating) {
+          handle_parent_msg(line, line_len);
+        }
         free(line);
       }
 
       if (eof) {
-        /* Parent closed pipe -> tell child to exit */
+        /* Parent closed pipe -> this node and its subtree must exit. */
         trigger_termination();
+        close_if_open(&g_node.from_parent_fd);
       }
     }
 
@@ -1313,7 +1390,9 @@ int main(int argc, char *argv[]) {
           char *line = NULL;
           size_t line_len = 0;
           while (lb_pop_line(&curr->in_buf, &line, &line_len) == 1) {
-            handle_child_msg(curr, line, line_len);
+            if (!g_node.is_terminating) {
+              handle_child_msg(curr, line, line_len);
+            }
             free(line);
           }
 
@@ -1324,11 +1403,9 @@ int main(int argc, char *argv[]) {
       }
 
       if (child_exited) {
-        close(curr->from_child_fd);
-        if (curr->to_child_fd >= 0) {
-          close(curr->to_child_fd);
-        }
-        waitpid(curr->pid, NULL, WNOHANG);
+        close_if_open(&curr->from_child_fd);
+        close_if_open(&curr->to_child_fd);
+        wait_pid_blocking(curr->pid);
         remove_child_node(curr);
       }
 
@@ -1397,10 +1474,10 @@ int main(int argc, char *argv[]) {
       }
 
       if (consultant_done) {
-        close(c_curr->from_consultant_fd);
-        waitpid(c_curr->pid, NULL, 0);
+        close_if_open(&c_curr->from_consultant_fd);
+        wait_pid_blocking(c_curr->pid);
 
-        if (!c_curr->got_ok) {
+        if (!c_curr->got_ok && !g_node.is_terminating) {
           /* Failed or premature EOF: retry for the same key */
           char *h = duplicate_string(c_curr->hash);
           char *k = duplicate_string(c_curr->key);
