@@ -153,22 +153,18 @@
 
 ### [ ] B-1. 實作 `create`
 
-- 在收到 `create <parent-node> <child-node>` 的 parent node 中 `fork()`，
-  且每次 create 恰好建立一個 direct child。
-- child 以 `exec()` 啟動同一個 `sp`，不要建立另一份不同的 node 程式。
-- 透過啟動參數讓 child 知道：
-  - 它是 node 而不是 SP main。
--  - node name。
-  - parent-to-child command fd 與 child-to-parent reply fd。
-- parent/child pipe fd 使用 close-on-exec 或明確關閉不屬於該 process 的端點，
-  避免 EOF 永遠不出現。
-- node command 的第一個參數是 node name；root 依 node route 將 command
-  傳給正確的 direct child。
-- 不要把 node name 誤當成 FIFO path；測試協定沒有要求 student program
-  從 `create` 參數建立 FIFO。
-- protocol fd 使用 `O_CLOEXEC` 或明確設定 `FD_CLOEXEC`，避免後續 create/consultant
-  繼承不應持有的 fd。
-- 父程序在 child 啟動失敗時要處理錯誤並回收 PID/fd，不可留下半初始化 node。
+- [x] 先保留 single-node 版本為 `sp_node_finish.c`，確保後續修改可回復。
+- [x] 支援 `create <parent-node> <child-node>` 的 parser 與 parent name 驗證。
+- [x] 由 parent `fork()` 一個 direct child。
+- [x] child 使用 `exec()` 啟動同一個 `sp`，並透過啟動參數取得 node name
+      與 command/ready fd。
+- [x] 使用 parent-to-child command pipe 與初始化 `READY` handshake。
+- [x] parent 保存 child name、PID 與 command fd，並拒絕重複 child name。
+- [x] parent/child 在 fork 後關閉不使用的 pipe ends。
+- [x] root 結束時送出 `kill`、關閉 command fd、`waitpid()` child 並釋放 metadata。
+- [ ] 將 node command route 到正確的 direct child，並支援 child 建立自己的 child。
+- [ ] 完成 child 啟動失敗與 child 中途退出時的完整狀態回報。
+- [ ] 以 Linux toolchain 編譯並驗證 process/fd 行為。
 
 ### [ ] B-2. 完成 node 的輸入輸出
 

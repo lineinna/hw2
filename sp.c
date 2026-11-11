@@ -1,10 +1,13 @@
 #include "sp.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 typedef struct Entry {
@@ -19,6 +22,13 @@ typedef struct {
   size_t capacity;
 } InputBuffer;
 
+typedef struct ChildNode {
+  char *name;
+  pid_t pid;
+  int command_fd;
+  struct ChildNode *next;
+} ChildNode;
+
 enum {
   READ_LINE_OK = 0,
   READ_LINE_EOF = 1,
@@ -26,6 +36,11 @@ enum {
 };
 
 static Entry *table = NULL;
+static const char *program_path = NULL;
+static const char *current_node = "main";
+static int child_mode = 0;
+static int child_command_fd = -1;
+static ChildNode *children = NULL;
 static Entry *find_entry(const char *key);
 static int set_entry(const char *key, const char *value);
 static int remove_entry(const char *key);
@@ -39,6 +54,13 @@ static int parse_single_key(const char *line, size_t line_len,
                             const char *name, char **key);
 static int parse_two_keys(const char *line, size_t line_len, const char *name,
                           char **first, char **second);
+static int write_all(int fd, const char *data, size_t length);
+static int write_line(int fd, const char *line);
+static int read_line_from_fd(int fd, char **line, size_t *line_len);
+static ChildNode *find_child(const char *name);
+static int spawn_child(const char *parent_name, const char *child_name);
+static void free_children(void);
+static int run_command_loop(int fd);
 
 static int command_name_matches(const char *line, size_t line_len,
                                 const char *name) {
@@ -287,6 +309,239 @@ static void free_table(void) {
   table = NULL;
 }
 
+static int write_all(int fd, const char *data, size_t length) {
+  size_t offset = 0;
+
+  while (offset < length) {
+    ssize_t written = write(fd, data + offset, length - offset);
+    if (written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if (written == 0) {
+      return -1;
+    }
+    offset += (size_t)written;
+  }
+
+  return 0;
+}
+
+static int write_line(int fd, const char *line) {
+  size_t length = strlen(line);
+  if (length == SIZE_MAX || write_all(fd, line, length) != 0 ||
+      write_all(fd, "\n", 1) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static int read_line_from_fd(int fd, char **line, size_t *line_len) {
+  char *data = NULL;
+  size_t length = 0;
+  size_t capacity = 0;
+
+  *line = NULL;
+  *line_len = 0;
+
+  for (;;) {
+    char character;
+    ssize_t result = read(fd, &character, 1);
+    if (result < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      free(data);
+      return -1;
+    }
+    if (result == 0) {
+      if (length == 0) {
+        free(data);
+        return 1;
+      }
+      break;
+    }
+    if (character == '\n') {
+      break;
+    }
+    if (length == SIZE_MAX - 1) {
+      free(data);
+      return -1;
+    }
+    if (length + 1 >= capacity) {
+      size_t new_capacity = capacity == 0 ? 4096 : capacity;
+      while (new_capacity <= length + 1) {
+        if (new_capacity > SIZE_MAX / 2) {
+          new_capacity = length + 2;
+          break;
+        }
+        new_capacity *= 2;
+      }
+      char *new_data = realloc(data, new_capacity);
+      if (new_data == NULL) {
+        free(data);
+        return -1;
+      }
+      data = new_data;
+      capacity = new_capacity;
+    }
+    data[length++] = character;
+  }
+
+  if (data == NULL) {
+    data = malloc(1);
+    if (data == NULL) {
+      return -1;
+    }
+  }
+  data[length] = '\0';
+  *line = data;
+  *line_len = length;
+  return 0;
+}
+
+static ChildNode *find_child(const char *name) {
+  for (ChildNode *child = children; child != NULL; child = child->next) {
+    if (strcmp(child->name, name) == 0) {
+      return child;
+    }
+  }
+  return NULL;
+}
+
+static int spawn_child(const char *parent_name, const char *child_name) {
+  int command_pipe[2] = {-1, -1};
+  int ready_pipe[2] = {-1, -1};
+
+  if (pipe(command_pipe) != 0 || pipe(ready_pipe) != 0) {
+    perror("pipe");
+    if (command_pipe[0] >= 0) {
+      close(command_pipe[0]);
+      close(command_pipe[1]);
+    }
+    if (ready_pipe[0] >= 0) {
+      close(ready_pipe[0]);
+      close(ready_pipe[1]);
+    }
+    return -1;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork");
+    close(command_pipe[0]);
+    close(command_pipe[1]);
+    close(ready_pipe[0]);
+    close(ready_pipe[1]);
+    return -1;
+  }
+
+  if (pid == 0) {
+    char command_fd[32];
+    char ready_fd[32];
+    char *const arguments[] = {
+        (char *)program_path, "--node", (char *)child_name, command_fd,
+        ready_fd, NULL};
+
+    close(command_pipe[1]);
+    close(ready_pipe[0]);
+    snprintf(command_fd, sizeof(command_fd), "%d", command_pipe[0]);
+    snprintf(ready_fd, sizeof(ready_fd), "%d", ready_pipe[1]);
+    execvp(program_path, arguments);
+    perror("execvp");
+    _exit(127);
+  }
+
+  close(command_pipe[0]);
+  close(ready_pipe[1]);
+
+  char *ready = NULL;
+  size_t ready_length = 0;
+  int read_result = read_line_from_fd(ready_pipe[0], &ready, &ready_length);
+  close(ready_pipe[0]);
+  if (read_result != 0 || strcmp(ready, "READY") != 0) {
+    fprintf(stderr, "Child '%s' failed to initialize\n", child_name);
+    free(ready);
+    close(command_pipe[1]);
+    (void)waitpid(pid, NULL, 0);
+    return -1;
+  }
+  free(ready);
+
+  ChildNode *child = malloc(sizeof(*child));
+  if (child == NULL) {
+    perror("malloc");
+    close(command_pipe[1]);
+    (void)waitpid(pid, NULL, 0);
+    return -1;
+  }
+  child->name = duplicate_string(child_name);
+  if (child->name == NULL) {
+    free(child);
+    close(command_pipe[1]);
+    (void)waitpid(pid, NULL, 0);
+    return -1;
+  }
+  child->pid = pid;
+  child->command_fd = command_pipe[1];
+  child->next = children;
+  children = child;
+  (void)parent_name;
+  return 0;
+}
+
+static void free_children(void) {
+  ChildNode *child = children;
+  while (child != NULL) {
+    ChildNode *next = child->next;
+    (void)write_line(child->command_fd, "kill");
+    close(child->command_fd);
+    (void)waitpid(child->pid, NULL, 0);
+    free(child->name);
+    free(child);
+    child = next;
+  }
+  children = NULL;
+}
+
+static int run_command_loop(int fd) {
+  InputBuffer input = {0};
+  int exit_status = 0;
+  int running = 1;
+
+  while (running) {
+    char *command_buffer = NULL;
+    size_t command_length = 0;
+    int read_result =
+        read_command_line(fd, &input, &command_buffer, &command_length);
+
+    if (read_result == READ_LINE_EOF) {
+      break;
+    }
+    if (read_result == READ_LINE_ERROR) {
+      exit_status = 1;
+      break;
+    }
+
+    Command command = {
+        .buf = command_buffer,
+        .len = command_length,
+        .type = classify_command(command_buffer, command_length),
+    };
+    int handler_result = command_handler(&command);
+    free(command_buffer);
+
+    if (handler_result == 1 && command.type == KILL) {
+      running = 0;
+    }
+  }
+
+  free(input.data);
+  return exit_status;
+}
+
 static int read_command_line(int fd, InputBuffer *input, char **line,
                              size_t *line_len) {
   char chunk[4096];
@@ -382,46 +637,47 @@ static int read_command_line(int fd, InputBuffer *input, char **line,
 }
 
 int main(int argc, char *argv[]) {
-  (void)argv;
+  program_path = argv[0];
 
-  if (argc != 1) {
+  if (argc == 1) {
+    current_node = "main";
+  } else if (argc == 5 && strcmp(argv[1], "--node") == 0) {
+    char *end = NULL;
+    long command_fd = strtol(argv[3], &end, 10);
+    if (*argv[3] == '\0' || *end != '\0' || command_fd < 0 ||
+        command_fd > INT_MAX) {
+      fprintf(stderr, "Invalid child command fd\n");
+      return 1;
+    }
+
+    long ready_fd = strtol(argv[4], &end, 10);
+    if (*argv[4] == '\0' || *end != '\0' || ready_fd < 0 ||
+        ready_fd > INT_MAX) {
+      fprintf(stderr, "Invalid child ready fd\n");
+      return 1;
+    }
+
+    current_node = argv[2];
+    child_mode = 1;
+    child_command_fd = (int)command_fd;
+    if (write_line((int)ready_fd, "READY") != 0) {
+      perror("write child ready");
+      close(child_command_fd);
+      close((int)ready_fd);
+      return 1;
+    }
+    close((int)ready_fd);
+  } else {
     fprintf(stderr, "Usage: ./sp\n");
     return 1;
   }
 
-  InputBuffer input = {0};
-  int exit_status = 0;
-  int running = 1;
-
-  while (running) {
-    char *command_buffer = NULL;
-    size_t command_length = 0;
-    int read_result =
-        read_command_line(STDIN_FILENO, &input, &command_buffer,
-                          &command_length);
-
-    if (read_result == READ_LINE_EOF) {
-      break;
-    }
-    if (read_result == READ_LINE_ERROR) {
-      exit_status = 1;
-      break;
-    }
-
-    Command command = {
-        .buf = command_buffer,
-        .len = command_length,
-        .type = classify_command(command_buffer, command_length),
-    };
-    int handler_result = command_handler(&command);
-    free(command_buffer);
-
-    if (handler_result == 1 && command.type == KILL) {
-      running = 0;
-    }
+  int exit_status = run_command_loop(child_mode ? child_command_fd
+                                                : STDIN_FILENO);
+  if (child_mode) {
+    close(child_command_fd);
   }
-
-  free(input.data);
+  free_children();
   free_table();
   return exit_status;
 }
@@ -447,10 +703,22 @@ int command_handler(Command *cmd) {
 }
 
 int create_handler(char *buf, size_t len) {
-  // TODO: Implement the CREATE command handler.
-  (void)buf;
-  (void)len;
-  return -1;
+  char *parent_name = NULL;
+  char *child_name = NULL;
+
+  if (parse_two_keys(buf, len, "create", &parent_name, &child_name) != 0 ||
+      strcmp(parent_name, current_node) != 0 ||
+      find_child(child_name) != NULL) {
+    fprintf(stderr, "Invalid create command\n");
+    free(parent_name);
+    free(child_name);
+    return -1;
+  }
+
+  int result = spawn_child(parent_name, child_name);
+  free(parent_name);
+  free(child_name);
+  return result;
 }
 
 int store_handler(char *buf, size_t len) {
