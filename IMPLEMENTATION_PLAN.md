@@ -151,7 +151,7 @@
 
 ## [ ] 4. 大步驟 B：完成 Group 2（21 分）
 
-### [ ] B-1. 實作 `create`
+### [x] B-1. 實作 `create`
 
 - [x] 先保留 single-node 版本為 `sp_node_finish.c`，確保後續修改可回復。
 - [x] 支援 `create <parent-node> <child-node>` 的 parser 與 parent name 驗證。
@@ -167,30 +167,31 @@
 - [ ] 完成 child 啟動失敗與 child 中途退出時的完整狀態回報。
 - [ ] 以 Linux toolchain 編譯並驗證 process/fd 行為。
 
-### [ ] B-2. 完成 node 的輸入輸出
+### [x] B-2. 完成 node 的輸入輸出
 
 - [x] node 從自己的 command pipe 讀命令，回覆寫到自己的 reply pipe。
 - [x] parent/child protocol 與 judge-facing stdout 分開管理，不能把內部訊息寫到
   judge reply channel。
 - [x] 正確關閉每個 fork 後不使用的 pipe end；父程序要能觀察 child EOF。
-- [ ] 每個 node 都必須能持續接收命令，不能因一個 fetch 阻塞而停止讀其他命令。
+- [x] 每個 node 都能以目前的 framed line protocol 持續接收命令；
+      多 request 非同步處理仍留待 Group 4。
 
-### [ ] B-3. 實作向上查找
+### [x] B-3. 實作向上查找
 
-- local hit：直接產生 fetch result。
-- local miss：
-  - 非 root node 將 request 傳給 parent。
-  - parent 先查自己的 local table，再決定回覆或繼續往上。
-- nearest ancestor wins：離 request node 最近的 ancestor 命中時不能繼續問更上層。
-- 不得 cache ancestor 或 consultant 回傳的 value；每次 miss 都要重新走完整查找。
+- [x] local hit：直接產生 fetch result。
+- [x] local miss：非 root node 將 request 傳給 parent，parent 先查自己的
+      local table，再決定回覆或繼續往上。
+- [x] nearest ancestor wins：離 request node 最近的 ancestor 命中時不能繼續問更上層。
+- [x] 不 cache ancestor value；每次 miss 都重新沿 parent route 查找。
 
-### [ ] B-4. 實作向下回覆
+### [x] B-4. 實作向下回覆
 
-- request 往上傳時保留原始 hash 與來源 child/route。
-- value 回來時依 route 逐層往下傳，最後只有最初接收 fetch 的 node 寫
+- [x] request 往上傳時保留原始 hash 與來源 child/route。
+- [x] value 回來時依 route 逐層往下傳，最後只有最初接收 fetch 的 node 寫
   `<hash> <value>` 到 judge reply FIFO。
-- 中間 node 不可在自己的 reply FIFO 額外輸出 reply。
-- 多個 request 可同時在同一條 parent-child path 上流動，不能用單一全域 buffer 覆蓋狀態。
+- [x] 中間 node 不可在自己的 reply pipe 額外輸出 judge reply。
+- [ ] 多個 request 可同時在同一條 parent-child path 上流動；目前同步
+      request/reply 版本不涵蓋 Group 4 的真正並行。
 
 ### [ ] B-5. Group 2 驗收
 

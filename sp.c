@@ -30,6 +30,12 @@ typedef struct ChildNode {
   struct ChildNode *next;
 } ChildNode;
 
+typedef struct Route {
+  char *name;
+  ChildNode *child;
+  struct Route *next;
+} Route;
+
 enum {
   READ_LINE_OK = 0,
   READ_LINE_EOF = 1,
@@ -43,6 +49,7 @@ static int child_mode = 0;
 static int child_command_fd = -1;
 static int child_reply_fd = -1;
 static ChildNode *children = NULL;
+static Route *routes = NULL;
 static Entry *find_entry(const char *key);
 static int set_entry(const char *key, const char *value);
 static int remove_entry(const char *key);
@@ -60,8 +67,11 @@ static int write_all(int fd, const char *data, size_t length);
 static int write_line(int fd, const char *line);
 static int read_line_from_fd(int fd, char **line, size_t *line_len);
 static ChildNode *find_child(const char *name);
+static ChildNode *find_route(const char *name);
+static int add_route(const char *name, ChildNode *child);
 static int spawn_child(const char *parent_name, const char *child_name);
 static void free_children(void);
+static void free_routes(void);
 static int run_command_loop(int fd);
 static int command_target(const Command *command, char **target);
 static int normalize_local_command(const Command *command, char **buffer,
@@ -417,6 +427,31 @@ static ChildNode *find_child(const char *name) {
   return NULL;
 }
 
+static ChildNode *find_route(const char *name) {
+  for (Route *route = routes; route != NULL; route = route->next) {
+    if (strcmp(route->name, name) == 0) {
+      return route->child;
+    }
+  }
+  return NULL;
+}
+
+static int add_route(const char *name, ChildNode *child) {
+  Route *route = malloc(sizeof(*route));
+  if (route == NULL) {
+    return -1;
+  }
+  route->name = duplicate_string(name);
+  if (route->name == NULL) {
+    free(route);
+    return -1;
+  }
+  route->child = child;
+  route->next = routes;
+  routes = route;
+  return 0;
+}
+
 static int spawn_child(const char *parent_name, const char *child_name) {
   int command_pipe[2] = {-1, -1};
   int reply_pipe[2] = {-1, -1};
@@ -508,6 +543,15 @@ static int spawn_child(const char *parent_name, const char *child_name) {
   child->reply_fd = reply_pipe[0];
   child->next = children;
   children = child;
+  if (add_route(child_name, child) != 0) {
+    children = child->next;
+    close(child->command_fd);
+    close(child->reply_fd);
+    (void)waitpid(child->pid, NULL, 0);
+    free(child->name);
+    free(child);
+    return -1;
+  }
   (void)parent_name;
   return 0;
 }
@@ -525,6 +569,17 @@ static void free_children(void) {
     child = next;
   }
   children = NULL;
+}
+
+static void free_routes(void) {
+  Route *route = routes;
+  while (route != NULL) {
+    Route *next = route->next;
+    free(route->name);
+    free(route);
+    route = next;
+  }
+  routes = NULL;
 }
 
 static int command_target(const Command *command, char **target) {
@@ -583,6 +638,14 @@ static int command_target(const Command *command, char **target) {
                     ? *target
                     : NULL;
     }
+    return *target == NULL ? -1 : 0;
+  }
+
+  if (command->type == CREATE) {
+    *target = copy_range(line + first_start, first_end - first_start,
+                         target) == 0
+                  ? *target
+                  : NULL;
     return *target == NULL ? -1 : 0;
   }
 
@@ -682,7 +745,7 @@ static int process_command(const Command *command) {
   }
 
   if (strcmp(target, current_node) != 0) {
-    ChildNode *child = find_child(target);
+    ChildNode *child = find_route(target);
     if (child == NULL || write_line(child->command_fd, command->buf) != 0) {
       free(target);
       return -1;
@@ -697,6 +760,41 @@ static int process_command(const Command *command) {
       free(target);
       return -1;
     }
+    if (command->type == CREATE && strncmp(response, "CREATED ", 8) == 0) {
+      if (add_route(response + 8, child) != 0) {
+        free(response);
+        free(target);
+        return -1;
+      }
+    }
+
+    if (command->type == FETCH && strncmp(response, "MISS ", 5) == 0) {
+      char *hash = NULL;
+      char *key = NULL;
+      if (parse_two_keys(command->buf, command->len, "fetch", &hash, &key) ==
+          0) {
+        Entry *entry = find_entry(key);
+        if (entry != NULL) {
+          size_t hash_length = strlen(hash);
+          size_t value_length = strlen(entry->value);
+          if (hash_length <= SIZE_MAX - value_length - 2) {
+            char *ancestor_reply =
+                malloc(hash_length + value_length + 2);
+            if (ancestor_reply != NULL) {
+              memcpy(ancestor_reply, hash, hash_length);
+              ancestor_reply[hash_length] = ' ';
+              memcpy(ancestor_reply + hash_length + 1, entry->value,
+                     value_length + 1);
+              free(response);
+              response = ancestor_reply;
+            }
+          }
+        }
+      }
+      free(hash);
+      free(key);
+    }
+
     if (child_mode) {
       int result = write_line(child_reply_fd, response);
       free(response);
@@ -704,11 +802,14 @@ static int process_command(const Command *command) {
       return result == 0 ? 0 : -1;
     }
     int result = 0;
-    if (strcmp(response, "ERR") == 0) {
+    if (command->type == CREATE &&
+        strncmp(response, "CREATED ", 8) == 0) {
+      result = 0;
+    } else if (strcmp(response, "ERR") == 0) {
       result = -1;
-    } else if (strcmp(response, "MISS") == 0 ||
+    } else if (strncmp(response, "MISS", 4) == 0 ||
                strcmp(response, "OK") == 0) {
-      result = strcmp(response, "MISS") == 0 ? 1 : 0;
+      result = strncmp(response, "MISS", 4) == 0 ? 1 : 0;
     } else if (printf("%s\n", response) < 0 || fflush(stdout) != 0) {
       result = -1;
     }
@@ -730,9 +831,29 @@ static int process_command(const Command *command) {
   free(local_buffer);
 
   if (child_mode && command->type != FETCH) {
-    if (write_line(child_reply_fd, result < 0 ? "ERR" : "OK") != 0) {
+    char *reply = NULL;
+    if (result == 0 && command->type == CREATE) {
+      char *parent = NULL;
+      char *child = NULL;
+      if (parse_two_keys(command->buf, command->len, "create", &parent,
+                         &child) == 0) {
+        size_t child_length = strlen(child);
+        reply = malloc(child_length + 9);
+        if (reply != NULL) {
+          memcpy(reply, "CREATED ", 8);
+          memcpy(reply + 8, child, child_length + 1);
+        }
+      }
+      free(parent);
+      free(child);
+    }
+    if (reply == NULL) {
+      reply = duplicate_string(result < 0 ? "ERR" : "OK");
+    }
+    if (reply == NULL || write_line(child_reply_fd, reply) != 0) {
       result = -1;
     }
+    free(reply);
   }
   free(target);
   return result;
@@ -919,6 +1040,7 @@ int main(int argc, char *argv[]) {
     close(child_reply_fd);
   }
   free_children();
+  free_routes();
   free_table();
   return exit_status;
 }
