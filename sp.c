@@ -1026,31 +1026,34 @@ int main(int argc, char *argv[]) {
       break;
     }
 
-    char *command_buffer = NULL;
-    size_t command_length = 0;
-    int read_result =
-        read_command_line(child_mode ? child_command_fd : STDIN_FILENO, &input,
-                          &command_buffer,
-                          &command_length);
+    if (poll_fds[0].revents & POLLIN) {
+      char *command_buffer = NULL;
+      size_t command_length = 0;
+      int read_result = read_command_line(
+          child_mode ? child_command_fd : STDIN_FILENO, &input,
+          &command_buffer, &command_length);
 
-    if (read_result == READ_LINE_EOF) {
-      break;
-    }
-    if (read_result == READ_LINE_ERROR) {
-      exit_status = 1;
-      break;
-    }
+      if (read_result == READ_LINE_EOF) {
+        free(command_buffer);
+        break;
+      }
+      if (read_result == READ_LINE_ERROR) {
+        free(command_buffer);
+        exit_status = 1;
+        break;
+      }
 
-    Command command = {
-        .buf = command_buffer,
-        .len = command_length,
-        .type = classify_command(command_buffer, command_length),
-    };
-    int handler_result = command_handler(&command);
-    free(command_buffer);
+      Command command = {
+          .buf = command_buffer,
+          .len = command_length,
+          .type = classify_command(command_buffer, command_length),
+      };
+      int handler_result = command_handler(&command);
+      free(command_buffer);
 
-    if (handler_result == 1 && command.type == KILL) {
-      running = 0;
+      if (handler_result == 1 && command.type == KILL) {
+        running = 0;
+      }
     }
   }
 
