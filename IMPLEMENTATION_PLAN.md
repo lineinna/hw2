@@ -162,7 +162,7 @@
       `open()` 等待 judge 開啟另一端。
 - [x] child 開啟 command FIFO 作為 command channel、reply FIFO 作為 reply
       channel，並保存 FIFO path 供 kill 時 `unlink()`。
-- [ ] 明確管理 fork/exec 後的 fd ownership，避免 child 繼承其他 node 的
+- [x] 明確管理 fork/exec 後的 fd ownership，避免 child 繼承其他 node 的
       pipe/FIFO write end。
 - [ ] 以 Linux toolchain 編譯並驗證 process、FIFO 與 fd 行為。
 
@@ -170,7 +170,7 @@
 
 - [ ] node 從自己的 judge-facing command channel 讀命令，fetch 回覆寫到自己
       的 judge-facing reply channel。
-- [ ] parent/child protocol 與 judge-facing FIFO/STDIO 分開管理，不能把內部
+- [x] parent/child protocol 與 judge-facing FIFO/STDIO 分開管理，不能把內部
       訊息寫到 judge reply channel。
 - [ ] protocol message 保留 fetch hash、key 與 request 方向/來源資訊，讓 reply
       能沿唯一路徑返回原始 node。

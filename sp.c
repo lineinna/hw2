@@ -29,6 +29,8 @@ typedef struct Child {
   pid_t pid;
   char *command_fifo;
   char *reply_fifo;
+  int to_child_fd;
+  int from_child_fd;
   struct Child *next;
 } Child;
 
@@ -43,6 +45,8 @@ static Child *children = NULL;
 static int child_mode = 0;
 static int child_command_fd = -1;
 static int child_reply_fd = -1;
+static int parent_read_fd = -1;
+static int parent_write_fd = -1;
 static char *child_command_fifo = NULL;
 static char *child_reply_fifo = NULL;
 static volatile sig_atomic_t stopping = 0;
@@ -85,6 +89,29 @@ static int duplicate_fifo_path(const char *path, char **copy) {
     return -1;
   }
   return copy_range(path, strlen(path), copy);
+}
+
+static int set_close_on_exec(int fd) {
+  int flags = fcntl(fd, F_GETFD);
+  if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static int protect_child_fds(void) {
+  if (child_mode &&
+      (set_close_on_exec(parent_read_fd) != 0 ||
+       set_close_on_exec(parent_write_fd) != 0)) {
+    return -1;
+  }
+  for (Child *child = children; child != NULL; child = child->next) {
+    if (set_close_on_exec(child->to_child_fd) != 0 ||
+        set_close_on_exec(child->from_child_fd) != 0) {
+      return -1;
+    }
+  }
+  return 0;
 }
 
 static int command_name_matches(const char *line, size_t line_len,
@@ -338,6 +365,8 @@ static void free_children(void) {
   Child *child = children;
   while (child != NULL) {
     Child *next = child->next;
+    close(child->to_child_fd);
+    close(child->from_child_fd);
     if (kill(child->pid, SIGTERM) != 0 && errno != ESRCH) {
       perror("kill child");
     }
@@ -353,7 +382,8 @@ static void free_children(void) {
 }
 
 static int add_child(pid_t pid, const char *command_fifo,
-                     const char *reply_fifo) {
+                     const char *reply_fifo, int to_child_fd,
+                     int from_child_fd) {
   Child *child = malloc(sizeof(*child));
   if (child == NULL) {
     return -1;
@@ -361,6 +391,8 @@ static int add_child(pid_t pid, const char *command_fifo,
   child->pid = pid;
   child->command_fifo = NULL;
   child->reply_fifo = NULL;
+  child->to_child_fd = to_child_fd;
+  child->from_child_fd = from_child_fd;
   child->next = children;
 
   if (duplicate_fifo_path(command_fifo, &child->command_fifo) != 0 ||
@@ -376,22 +408,67 @@ static int add_child(pid_t pid, const char *command_fifo,
 }
 
 static int spawn_child(const char *command_fifo, const char *reply_fifo) {
+  int to_child[2] = {-1, -1};
+  int from_child[2] = {-1, -1};
+  if (protect_child_fds() != 0) {
+    perror("fcntl child fd");
+    return -1;
+  }
+  if (pipe(to_child) != 0 || pipe(from_child) != 0) {
+    perror("pipe");
+    if (to_child[0] >= 0) {
+      close(to_child[0]);
+      close(to_child[1]);
+    }
+    if (from_child[0] >= 0) {
+      close(from_child[0]);
+      close(from_child[1]);
+    }
+    return -1;
+  }
+
   pid_t pid = fork();
   if (pid < 0) {
     perror("fork");
+    close(to_child[0]);
+    close(to_child[1]);
+    close(from_child[0]);
+    close(from_child[1]);
     return -1;
   }
 
   if (pid == 0) {
+    char parent_read[32];
+    char parent_write[32];
+    (void)snprintf(parent_read, sizeof(parent_read), "%d", from_child[0]);
+    (void)snprintf(parent_write, sizeof(parent_write), "%d", to_child[1]);
+    close(to_child[0]);
+    close(from_child[1]);
     char *const child_argv[] = {
         (char *)program_path, (char *)"--node", (char *)command_fifo,
-        (char *)reply_fifo, NULL};
+        (char *)reply_fifo, parent_read, parent_write, NULL};
     execv(program_path, child_argv);
     perror("exec sp child");
     _exit(127);
   }
 
-  if (add_child(pid, command_fifo, reply_fifo) != 0) {
+  close(to_child[1]);
+  close(from_child[0]);
+  if (set_close_on_exec(to_child[0]) != 0 ||
+      set_close_on_exec(from_child[1]) != 0) {
+    perror("fcntl child fd");
+    close(to_child[0]);
+    close(from_child[1]);
+    if (kill(pid, SIGTERM) != 0 && errno != ESRCH) {
+      perror("kill child");
+    }
+    (void)waitpid(pid, NULL, 0);
+    return -1;
+  }
+  if (add_child(pid, command_fifo, reply_fifo, to_child[0],
+                from_child[1]) != 0) {
+    close(to_child[0]);
+    close(from_child[1]);
     if (kill(pid, SIGTERM) != 0 && errno != ESRCH) {
       perror("kill child");
     }
@@ -502,8 +579,23 @@ static int read_command_line(int fd, InputBuffer *input, char **line,
 
 int main(int argc, char *argv[]) {
   program_path = argv[0];
-  if (argc == 4 && strcmp(argv[1], "--node") == 0) {
+  if (argc == 6 && strcmp(argv[1], "--node") == 0) {
+    char *end = NULL;
+    long parsed_read_fd = strtol(argv[4], &end, 10);
+    if (*argv[4] == '\0' || *end != '\0' || parsed_read_fd < 0 ||
+        parsed_read_fd > INT_MAX) {
+      fprintf(stderr, "Invalid parent read fd\n");
+      return 1;
+    }
+    long parsed_write_fd = strtol(argv[5], &end, 10);
+    if (*argv[5] == '\0' || *end != '\0' || parsed_write_fd < 0 ||
+        parsed_write_fd > INT_MAX) {
+      fprintf(stderr, "Invalid parent write fd\n");
+      return 1;
+    }
     child_mode = 1;
+    parent_read_fd = (int)parsed_read_fd;
+    parent_write_fd = (int)parsed_write_fd;
     if (duplicate_fifo_path(argv[2], &child_command_fifo) != 0 ||
         duplicate_fifo_path(argv[3], &child_reply_fifo) != 0) {
       fprintf(stderr, "Invalid FIFO path\n");
@@ -591,6 +683,8 @@ int main(int argc, char *argv[]) {
   if (child_mode) {
     close(child_command_fd);
     close(child_reply_fd);
+    close(parent_read_fd);
+    close(parent_write_fd);
     unlink(child_command_fifo);
     unlink(child_reply_fifo);
     free(child_command_fifo);
