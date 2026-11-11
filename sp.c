@@ -92,6 +92,11 @@ static int parse_single_key(const char *line, size_t line_len,
                             const char *name, char **key);
 static int parse_two_keys(const char *line, size_t line_len, const char *name,
                           char **first, char **second);
+static int parse_node_key_value(const char *line, size_t line_len,
+                                const char *name, char **node, char **key,
+                                char **value);
+static int parse_node_key(const char *line, size_t line_len, const char *name,
+                          char **node, char **key);
 
 static int command_name_matches(const char *line, size_t line_len,
                                 const char *name) {
@@ -264,6 +269,82 @@ static int parse_two_keys(const char *line, size_t line_len, const char *name,
     return -1;
   }
 
+  return 0;
+}
+
+static int parse_node_key_value(const char *line, size_t line_len,
+                                const char *name, char **node, char **key,
+                                char **value) {
+  size_t name_len = strlen(name);
+  size_t node_start = name_len + 1;
+  size_t node_end = node_start;
+  size_t key_start;
+  size_t key_end;
+
+  *node = NULL;
+  *key = NULL;
+  *value = NULL;
+  if (!command_name_matches(line, line_len, name) ||
+      line_len <= node_start) {
+    return -1;
+  }
+  while (node_end < line_len && line[node_end] != ' ') {
+    node_end++;
+  }
+  if (node_end == node_start || node_end == line_len) {
+    return -1;
+  }
+  key_start = node_end + 1;
+  key_end = key_start;
+  while (key_end < line_len && line[key_end] != ' ') {
+    key_end++;
+  }
+  if (key_end == key_start || key_end == line_len ||
+      copy_range(line + node_start, node_end - node_start, node) != 0 ||
+      copy_range(line + key_start, key_end - key_start, key) != 0 ||
+      copy_range(line + key_end + 1, line_len - key_end - 1, value) != 0 ||
+      (*value)[0] == '\0') {
+    free(*node);
+    free(*key);
+    free(*value);
+    *node = NULL;
+    *key = NULL;
+    *value = NULL;
+    return -1;
+  }
+  return 0;
+}
+
+static int parse_node_key(const char *line, size_t line_len, const char *name,
+                          char **node, char **key) {
+  size_t name_len = strlen(name);
+  size_t node_start = name_len + 1;
+  size_t node_end = node_start;
+  size_t key_start;
+
+  *node = NULL;
+  *key = NULL;
+  if (!command_name_matches(line, line_len, name) ||
+      line_len <= node_start) {
+    return -1;
+  }
+  while (node_end < line_len && line[node_end] != ' ') {
+    node_end++;
+  }
+  if (node_end == node_start || node_end == line_len) {
+    return -1;
+  }
+  key_start = node_end + 1;
+  if (key_start == line_len ||
+      strchr(line + key_start, ' ') != NULL ||
+      copy_range(line + node_start, node_end - node_start, node) != 0 ||
+      copy_range(line + key_start, line_len - key_start, key) != 0) {
+    free(*node);
+    free(*key);
+    *node = NULL;
+    *key = NULL;
+    return -1;
+  }
   return 0;
 }
 
@@ -1026,7 +1107,7 @@ int main(int argc, char *argv[]) {
       break;
     }
 
-    if (poll_fds[0].revents & POLLIN) {
+    if (poll_fds[0].revents & (POLLIN | POLLHUP)) {
       char *command_buffer = NULL;
       size_t command_length = 0;
       int read_result = read_command_line(
@@ -1112,11 +1193,14 @@ int create_handler(char *buf, size_t len) {
 }
 
 int store_handler(char *buf, size_t len) {
+  char *node = NULL;
   char *key = NULL;
   char *value = NULL;
 
-  if (parse_key_value(buf, len, "store", &key, &value) != 0) {
+  if (parse_node_key_value(buf, len, "store", &node, &key, &value) != 0 &&
+      parse_key_value(buf, len, "store", &key, &value) != 0) {
     fprintf(stderr, "Invalid store command\n");
+    free(node);
     return -1;
   }
 
@@ -1125,31 +1209,48 @@ int store_handler(char *buf, size_t len) {
     perror("set_entry");
   }
 
+  free(node);
   free(key);
   free(value);
   return result;
 }
 
 int delete_handler(char *buf, size_t len) {
+  char *node = NULL;
   char *key = NULL;
 
-  if (parse_single_key(buf, len, "delete", &key) != 0) {
+  if (parse_node_key(buf, len, "delete", &node, &key) != 0 &&
+      parse_single_key(buf, len, "delete", &key) != 0) {
     fprintf(stderr, "Invalid delete command\n");
+    free(node);
     return -1;
   }
 
   int result = remove_entry(key);
+  free(node);
   free(key);
   return result;
 }
 
 int fetch_handler(char *buf, size_t len) {
+  char *node = NULL;
   char *hash = NULL;
   char *key = NULL;
+  int node_form =
+      parse_node_key(buf, len, "fetch", &node, &key) == 0;
 
-  if (parse_two_keys(buf, len, "fetch", &hash, &key) != 0) {
+  if (!node_form && parse_two_keys(buf, len, "fetch", &hash, &key) != 0) {
     fprintf(stderr, "Invalid fetch command\n");
+    free(node);
     return -1;
+  }
+  if (node_form) {
+    hash = duplicate_string(node);
+    free(node);
+    if (hash == NULL) {
+      free(key);
+      return -1;
+    }
   }
 
   Entry *entry = find_entry(key);
@@ -1166,6 +1267,14 @@ int fetch_handler(char *buf, size_t len) {
     free(hash);
     free(key);
     return 1;
+  }
+
+  if (node_form) {
+    int result = write_line_fd(child_mode ? child_reply_fd : STDOUT_FILENO,
+                               entry->value);
+    free(hash);
+    free(key);
+    return result;
   }
 
   size_t reply_length = strlen(hash) + 1 + strlen(entry->value);
