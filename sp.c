@@ -711,7 +711,6 @@ static int handle_protocol_line(Child *source_child, const char *line) {
     } else {
       result = -1;
     }
-    remove_pending_request(request);
     free(hash);
     free(key);
     return result;
@@ -754,6 +753,7 @@ static int handle_protocol_line(Child *source_child, const char *line) {
         result = -1;
       }
     }
+    remove_pending_request(request);
     free(hash);
     free(value);
     return result;
