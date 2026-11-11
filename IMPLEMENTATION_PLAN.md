@@ -66,10 +66,10 @@
   - **node**：由父 node `fork()` 後 `exec()` 同一個 `sp`，透過 parent-child
     pipe 讀命令並寫回覆；judge-facing input/output 仍由 SP main 管理。
 - 先定義命令 parser，能正確辨識：
-  - `create <parent-node> <child-node>`
-  - `store <node> <key> <value>`
-  - `delete <node> <key>`
-  - `fetch <node> <key>`
+  - `create <command-fifo> <reply-fifo>`
+  - `store <key> <value>`
+  - `delete <key>`
+  - `fetch <hash> <key>`
   - `kill`
   - `update <consultant-path>`
 - parser 必須支援動態長度輸入；不要假設 key/value 可以放進固定大小 buffer。
@@ -89,7 +89,7 @@
 - 為每個 node 保存：
   - 子程序 PID。
   - 與每個 child 的父子 protocol pipe/file descriptor。
-  - child 的 command/reply pipe fd 與 node name。
+  - child 的 PID、command/reply FIFO path、FIFO fd 與 parent protocol fd。
   - child 的存活與 kill 狀態。
 - 父子 protocol 必須能同時承載多個 fetch request，不能只保存一個「目前查詢」。
 - 每一筆 fetch request 要有可辨識的 hash 與回傳方向資訊；hash 在 concurrent fetch
@@ -154,37 +154,32 @@
 ### [ ] B-1. 實作 `create`
 
 - [x] 先保留 single-node 版本為 `sp_node_finish.c`，確保後續修改可回復。
-- [x] 支援 `create <parent-node> <child-node>` 的 parser 與 parent name 驗證。
-- [x] 由 parent `fork()` 一個 direct child。
-- [x] child 使用 `exec()` 啟動同一個 `sp`，並透過啟動參數取得 node name
-      與 command/ready fd。
-- [x] 使用 parent-to-child command pipe 與初始化 `READY` handshake。
-- [x] parent 保存 child name、PID 與 command fd，並拒絕重複 child name。
-- [x] parent/child 在 fork 後關閉不使用的 pipe ends。
-- [x] root 結束時送出 `kill`、關閉 command fd、`waitpid()` child 並釋放 metadata。
-- [x] 將 node command route 到正確的 direct child，並支援 child 建立自己的 child。
-- [x] child 透過 reply pipe 回傳 `OK`、`ERR`、`MISS` 或 fetch reply。
-- [x] `kill <node>` 成功後由 parent `waitpid()`、關閉 fd、移除 child metadata
-      與所有 descendant route。
-- [x] nested child `exec()` 前關閉 inherited parent protocol fd。
-- [x] child command write/read 發生 EOF 或 pipe error 時，parent 會移除失效
-      child、關閉 fd 並 reap process。
-- [x] 建立 route 時拒絕已存在的 node name。
-- [ ] 完成 child 啟動失敗時對 judge 的明確錯誤回報。
-- [ ] 以 Linux toolchain 編譯並驗證 process/fd 行為。
+- [ ] 支援規格要求的 `create <command-fifo> <reply-fifo>`；不是 node name
+      routing，兩個 path 都是 absolute path 且不得包含 whitespace。
+- [ ] parent `fork()` 後由 child `exec()` 同一個 `sp`，確保 child 是
+      receiving node 的 direct child，且每個 create 只建立一個 process。
+- [ ] child 在開啟任一 FIFO 前先對兩個 path 執行 `mkfifo()`，再以 blocking
+      `open()` 等待 judge 開啟另一端。
+- [ ] child 開啟 command FIFO 作為 command channel、reply FIFO 作為 reply
+      channel，並保存 FIFO path 供 kill 時 `unlink()`。
+- [ ] 明確管理 fork/exec 後的 fd ownership，避免 child 繼承其他 node 的
+      pipe/FIFO write end。
+- [ ] 以 Linux toolchain 編譯並驗證 process、FIFO 與 fd 行為。
 
 ### [ ] B-2. 完成 node 的輸入輸出
 
-- [x] node 從自己的 command pipe 讀命令，回覆寫到自己的 reply pipe。
-- [x] parent/child protocol 與 judge-facing stdout 分開管理，不能把內部訊息寫到
-  judge reply channel。
-- [x] 正確關閉每個 fork 後不使用的 pipe end；父程序要能觀察 child EOF。
-- [x] 每個 node 都能以目前的 framed line protocol 持續接收命令；
-      多 request 非同步處理仍留待 Group 4。
+- [ ] node 從自己的 judge-facing command channel 讀命令，fetch 回覆寫到自己
+      的 judge-facing reply channel。
+- [ ] parent/child protocol 與 judge-facing FIFO/STDIO 分開管理，不能把內部
+      訊息寫到 judge reply channel。
+- [ ] protocol message 保留 fetch hash、key 與 request 方向/來源資訊，讓 reply
+      能沿唯一路徑返回原始 node。
+- [ ] 以 newline framing 和動態 buffer 處理 partial read/write、EINTR、EOF
+      與多筆訊息黏在同一個 pipe 的情況。
 
 ### [ ] B-3. 實作向上查找
 
-- [ ] local hit：直接產生 fetch result。
+- [ ] local hit：直接寫入 receiving node 的 reply FIFO/STDOUT。
 - [ ] local miss：非 root node 將 request 傳給 parent，parent 先查自己的
       local table，再決定回覆或繼續往上。
 - [ ] nearest ancestor wins：離 request node 最近的 ancestor 命中時不能繼續問更上層。
@@ -196,12 +191,13 @@
 - [ ] value 回來時依 route 逐層往下傳，最後只有最初接收 fetch 的 node 寫
   `<hash> <value>` 到 judge reply FIFO。
 - [ ] 中間 node 不可在自己的 reply pipe 額外輸出 judge reply。
-- [ ] 多個 request 可同時在同一條 parent-child path 上流動；目前同步
-      request/reply 版本不涵蓋 Group 4 的真正並行。
+- [ ] 以 poll/select 同時監聽 judge channel、parent protocol 與 child protocol；
+      不用 blocking read 等待單一 fetch 完成。
 
 ### [ ] B-5. Group 2 驗收
 
-- 執行 `tree_lookups/case-0` 到 `case-4`。
+- 先重新執行 `single_node/case-0` 到 `case-4` regression，再執行
+  `tree_lookups/case-0` 到 `case-4`。
 - 先驗證單層，再驗證多層：
   - child 找到 parent 的 value。
   - 三層樹找到最近 ancestor。
@@ -331,8 +327,8 @@
 - [x] M1c：完成 EOF、read/allocation error、空 command、handler result 與
       cleanup 的處理。
 - [x] M2：root kill、錯誤處理與 Group 1 全部通過。
-- [x] M3a：single-node regression test 通過；B-1 開發沒有破壞
-      `store/delete/fetch/kill`。
+- [x] M3a：single-node 完成版保存在 `sp_node_finish.c`；B 重做前先以此
+      版本恢復 `sp.c`，確保 `store/delete/fetch/kill` 行為基準不變。
 - [ ] M3：create、exec、FIFO 建立/開啟/清理。
 - [ ] M4：單一 ancestor lookup 與 route-based reply。
 - [ ] M5：多個 pending fetch 與 Group 2 全部通過。
