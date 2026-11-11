@@ -1008,6 +1008,34 @@ int main(int argc, char *argv[]) {
   int running = 1;
 
   while (running) {
+    if (!child_mode) {
+      char *command_buffer = NULL;
+      size_t command_length = 0;
+      int read_result = read_command_line(
+          STDIN_FILENO, &input, &command_buffer, &command_length);
+      if (read_result == READ_LINE_EOF) {
+        free(command_buffer);
+        break;
+      }
+      if (read_result == READ_LINE_ERROR) {
+        free(command_buffer);
+        exit_status = 1;
+        break;
+      }
+
+      Command command = {
+          .buf = command_buffer,
+          .len = command_length,
+          .type = classify_command(command_buffer, command_length),
+      };
+      int handler_result = command_handler(&command);
+      free(command_buffer);
+      if (handler_result == 1 && command.type == KILL) {
+        running = 0;
+      }
+      continue;
+    }
+
     size_t channel_count = 1 + (child_mode ? 1 : 0);
     for (Child *child = children; child != NULL; child = child->next) {
       channel_count++;
