@@ -3,6 +3,47 @@
 > 本文件是依據 `System Programming HW2.pdf`、`tests/public/points.toml`、
 > 公開測試案例與目前的 `sp.c/sp.h` 模板整理出的開發清單。  
 
+## 0. 目前狀態與下一步
+
+### 0-1. 目前已完成
+
+- [x] `classify_command()` 的 `.c/.h` 宣告已統一為 `CommandType`。
+- [x] 已有 `Entry` linked list，可保存 key/value。
+- [x] 已有 `store` 的新增與同 key 覆蓋邏輯。
+- [x] 已有 `delete` 的移除與記憶體釋放邏輯。
+- [x] 已有 `fetch` 的 local table 查找與 `<hash> <value>` 輸出邏輯。
+- [x] 已有動態 command line buffer，可處理超過固定 buffer 大小的輸入。
+- [x] 已有 `create/store/delete/fetch/kill/update` 的基本 command classification。
+
+### 0-2. 目前尚未完成
+
+- [x] root `main()` 已讀取 stdin、分類 command、呼叫 handler。
+- [x] root `main()` 已依 `kill_handler()` 的結果離開，並做最後 cleanup。
+- [ ] `create_handler()` 尚未實作。
+- [ ] `update_handler()` 尚未實作。
+- [ ] 尚未建立 child process、FIFO 與 parent/child protocol。
+- [ ] 尚未實作 ancestor lookup、非同步 fetch、consultant 與 subtree kill。
+
+### 0-3. 已完成的第一個開發批次
+
+這個批次只處理「單一 root process 的 command loop」，沒有先實作
+`create`、FIFO 或 consultant。具體順序如下：
+
+1. [x] 在 `main()` 建立並初始化 `InputBuffer`。
+2. [x] 反覆呼叫 `read_command_line(STDIN_FILENO, ...)` 取得完整的一行。
+3. [x] 正確處理 `READ_LINE_OK`、`READ_LINE_EOF` 與 `READ_LINE_ERROR`。
+4. [x] 將讀到的 line 放入 `Command.buf`，設定 `Command.len`。
+5. [x] 呼叫 `classify_command()` 設定 `Command.type`。
+6. [x] 呼叫 `command_handler()` 執行 `store/delete/fetch/kill`。
+7. [x] 每次 command 完成後釋放 `command.buf`，避免逐行 leak。
+8. [x] `kill_handler()` 回傳結束訊號時離開 loop；一般 command error 不應直接
+   讓 process 無聲退出。
+9. [x] 離開前釋放 input buffer 並呼叫 `free_table()`。
+10. [ ] 完成 Group 1 驗收，再開始 `create`。
+
+這個批次已完成；其他功能都不應該往下實作，必須先完成 Group 1 驗收，
+確認 parser、table、handlers 與主程式串接後的行為穩定。
+
 
 ## 1. 評分導向的總體策略
 
@@ -18,7 +59,7 @@
 
 ## 2. 先建立整體設計（所有功能的共同基礎）
 
-### A-1. 確認協定與執行模型
+### 2-1. 確認協定與執行模型
 
 - 區分兩種程序狀態：
   - **SP main**：由 judge 啟動，從標準輸入讀命令。
@@ -35,7 +76,7 @@
 - STDOUT 是 judge 的 protocol channel；除規格要求的 fetch reply 外，不要輸出診斷文字。
   - 診斷資訊應寫到 STDERR，並在提交前移除不必要輸出。
 
-### A-2. 設計本地資料結構
+### 2-2. 設計本地資料結構
 
 - 使用動態配置的 key-value table。
 - `store` 對同 key 做 replace。
@@ -43,7 +84,7 @@
 - 每個 node 都有獨立 table；不能用 shared memory、檔案或跨程序 cache 保存 value。
 - 所有 allocation、reallocation、字串複製與釋放都要檢查錯誤。
 
-### A-3. 設計父子程序通訊資料結構
+### 2-3. 設計父子程序通訊資料結構
 
 - 為每個 node 保存：
   - 子程序 PID。
@@ -61,36 +102,51 @@
 ### A-1. 啟動 SP main 與輸入迴圈
 
 - 驗證 `argc`；錯誤用法印到 STDERR 並回傳非零。
-- 初始化 root 的 local table、事件迴圈與清理狀態。
+- 初始化 root 的 `InputBuffer`、local table、事件迴圈與清理狀態。
 - 逐行讀 STDIN，完整讀取後再 parse 與執行。
+- 將 `read_command_line()` 的三種結果分開處理：
+  - `READ_LINE_OK`：分類並執行 command。
+  - `READ_LINE_EOF`：釋放 input buffer，正常結束。
+  - `READ_LINE_ERROR`：印出錯誤並以非零 status 結束。
+- 每一行 command 都要在 handler 返回後釋放，不可把同一個 buffer 重複使用
+  而造成 ownership 不清楚。
+- `kill` 是控制流程，不是一般 command error；root 收到後必須完成 cleanup
+  再結束。
 - 對空行、過短命令、allocation/read 失敗提供明確錯誤處理，不可 silent fallback。
 
 ### A-2. 實作 `store` 與 `delete`
 
-- `store main k v` 將 pair 放入 root table。
+- `store <key> <value>` 將 pair 放入目前 node 的 local table。
 - 重複 store 必須覆蓋舊 value。
 - `delete` 移除指定 key，並釋放 key/value 記憶體。
 - 這些命令不需要回覆 judge，但不能阻塞後續命令。
+- parser 失敗時不要呼叫 table operation；先釋放已配置的 key/value。
 
 ### A-3. 實作 root-only `fetch`
 
 - 先查 receiving node 的 local table。
 - 命中時輸出 `<hash> <value>`，只輸出一行有效 reply。
 - Group 1 沒有 miss，但 reply 格式、hash 配對與 flush 行為要先固定。
+- fetch miss 先維持明確的未命中結果，不要在 Group 1 階段提前加入
+  consultant 或 cache。
 
 ### A-4. 實作 root `kill`
 
 - 結束 root event loop。
-- Group 1 先確保沒有 child/consultant 時能正常釋放 table、fd 與記憶體。
+- Group 1 先確保沒有 child/consultant 時能正常釋放 table、input buffer
+  與其他已開啟的 fd。
 - root 由 judge kill 時必須以 status 0 結束。
 
 ### A-5. Group 1 驗收
 
-- 執行 `make test`，先確認 `single_node/case-0` 到 `case-4`。
+- 完成 A-1 到 A-4 後，才執行 `make test` 確認
+  `single_node/case-0` 到 `case-4`。
 - 特別驗證：
   - `case-0`：store/fetch。
   - `case-1`：store replace。
   - 其他案例：delete、長時間命令順序與重複執行。
+- 若 Group 1 還沒穩定，不要開始 fork/FIFO；否則無法區分是 local table
+  還是 process communication 的問題。
 - 只有 Group 1 全部穩定後才進入 fork/FIFO；否則後續問題難以定位。
 
 ## 4. 大步驟 B：完成 Group 2（21 分）
@@ -260,7 +316,11 @@
 
 ## 8. 建議的實作里程碑
 
-- [ ] M1：parser、dynamic local table、root `store/delete/fetch`。
+- [x] M1a：parser、dynamic local table、root `store/delete/fetch` 的 handler
+      與基本 memory ownership。
+- [x] M1b：把 `read_command_line()` 串到 `main()`，完成 root command loop。
+- [x] M1c：完成 EOF、read/allocation error、空 command、handler result 與
+      cleanup 的處理。
 - [ ] M2：root kill、錯誤處理與 Group 1 全部通過。
 - [ ] M3：create、exec、FIFO 建立/開啟/清理。
 - [ ] M4：單一 ancestor lookup 與 route-based reply。

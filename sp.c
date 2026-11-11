@@ -329,7 +329,22 @@ static int read_command_line(int fd, InputBuffer *input, char **line,
     }
 
     if (bytes_read == 0) {
-      return READ_LINE_EOF;
+      if (input->len == 0) {
+        return READ_LINE_EOF;
+      }
+
+      char *command = malloc(input->len + 1);
+      if (command == NULL) {
+        perror("malloc");
+        return READ_LINE_ERROR;
+      }
+
+      memcpy(command, input->data, input->len);
+      command[input->len] = '\0';
+      *line = command;
+      *line_len = input->len;
+      input->len = 0;
+      return READ_LINE_OK;
     }
 
     size_t count = (size_t)bytes_read;
@@ -367,37 +382,48 @@ static int read_command_line(int fd, InputBuffer *input, char **line,
 }
 
 int main(int argc, char *argv[]) {
-  if (argc > 1) {
+  (void)argv;
+
+  if (argc != 1) {
     fprintf(stderr, "Usage: ./sp\n");
     return 1;
   }
 
-  // TODO: Determine whether the current process is SP main.
-  //       After that, you may want to make the following code the same for both
-  //       SP main and SP child processes. Therefore, you will set some
-  //       variables here.
+  InputBuffer input = {0};
+  int exit_status = 0;
+  int running = 1;
 
-  // end TODO
-
-  while (1) {
+  while (running) {
     char *command_buffer = NULL;
-    Command command = {.buf = command_buffer, .len = 0, .type = UNKNOWN};
-    // TODO: poll the STDIO/FIFO for commands.
+    size_t command_length = 0;
+    int read_result =
+        read_command_line(STDIN_FILENO, &input, &command_buffer,
+                          &command_length);
 
-    // end TODO
+    if (read_result == READ_LINE_EOF) {
+      break;
+    }
+    if (read_result == READ_LINE_ERROR) {
+      exit_status = 1;
+      break;
+    }
 
-    // TODO: poll parent, and child processes for custom commands.
+    Command command = {
+        .buf = command_buffer,
+        .len = command_length,
+        .type = classify_command(command_buffer, command_length),
+    };
+    int handler_result = command_handler(&command);
+    free(command_buffer);
 
-    // end TODO
-
-    // TODO: classify the command and execute it.
-    command_handler(&command);
-    // end TODO
-
-    // TODO: handle custom commands.
-
-    // end TODO
+    if (handler_result == 1 && command.type == KILL) {
+      running = 0;
+    }
   }
+
+  free(input.data);
+  free_table();
+  return exit_status;
 }
 
 int command_handler(Command *cmd) {
